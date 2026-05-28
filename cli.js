@@ -250,6 +250,7 @@ const { values: flags } = parseArgs({
     "dry-run":    { type: "boolean" },
     "silent":     { type: "boolean" },
     limit:        { type: "string" },
+    text:         { type: "string" },
   },
   allowPositionals: true,
   strict: false,
@@ -665,6 +666,27 @@ switch (subcommand) {
       strategy: flags.strategy || "spot",
       single_sided_x: argv.includes("--single-sided-x"),
     }));
+    break;
+  }
+
+  // ── note --position <addr> --text "<instruction>" ────────────────
+  case "note": {
+    const positionAddress = flags.position;
+    if (!positionAddress) die("Usage: meridian note --position <addr> --text <instruction>");
+    const instruction = flags.text != null ? String(flags.text) : null;
+    const { setPositionInstruction } = await import("./state.js");
+    const ok = setPositionInstruction(positionAddress, instruction);
+    if (!ok) die("Position not found in state", { position: positionAddress });
+    out({ saved: true, position: positionAddress, instruction });
+    break;
+  }
+
+  // ── smart-wallets --pool <addr> ──────────────────
+  case "smart-wallets": {
+    const poolAddress = flags.pool;
+    if (!poolAddress) die("Usage: meridian smart-wallets --pool <pool_address>");
+    const { checkSmartWalletsOnPool } = await import("./smart-wallets.js");
+    out(await checkSmartWalletsOnPool({ pool_address: poolAddress }));
     break;
   }
 
