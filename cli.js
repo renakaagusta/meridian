@@ -693,3 +693,7 @@ switch (subcommand) {
   default:
     die(`Unknown command: ${subcommand}. Run 'meridian help' for usage.`);
 }
+
+// Force exit — web3.js keep-alive HTTP agents otherwise hold the event
+// loop open ~60s after work completes, hanging the subprocess for callers.
+process.exit(0);
