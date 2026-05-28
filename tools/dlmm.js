@@ -1,5 +1,4 @@
 import {
-  Connection,
   Keypair,
   PublicKey,
   SystemInstruction,
@@ -29,6 +28,7 @@ import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
+import { getConnection } from "./rpc.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -73,18 +73,11 @@ async function getDLMM() {
   };
 }
 
-// ─── Lazy wallet/connection init ──────────────────────────────
+// ─── Lazy wallet init ─────────────────────────────────────────
 // Avoids crashing on import when WALLET_PRIVATE_KEY is not yet set
-// (e.g. during screening-only tests).
-let _connection = null;
+// (e.g. during screening-only tests). Connection now lives in ./rpc.js
+// so URL-rotation/failover is shared with wallet.js.
 let _wallet = null;
-
-function getConnection() {
-  if (!_connection) {
-    _connection = new Connection(process.env.RPC_URL, "confirmed");
-  }
-  return _connection;
-}
 
 function getWallet() {
   if (!_wallet) {
