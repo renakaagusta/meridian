@@ -336,7 +336,8 @@ export function recallForPool(poolAddress) {
 
   // Deploy history summary
   if (entry.total_deploys > 0) {
-    lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${entry.win_rate}%, last outcome: ${entry.last_outcome}`);
+    const winPct = Number.isFinite(Number(entry.win_rate)) ? Math.round(Number(entry.win_rate) * 100) : "?";
+    lines.push(`POOL MEMORY [${entry.name}]: ${entry.total_deploys} past deploy(s), avg PnL ${entry.avg_pnl_pct}%, win rate ${winPct}%, last outcome: ${entry.last_outcome}`);
   }
 
   if (entry.cooldown_until && new Date(entry.cooldown_until) > new Date()) {

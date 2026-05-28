@@ -25,7 +25,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
@@ -466,6 +466,7 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  skipCooldown = false, // set by recenterPosition — re-entering the same pool we just closed
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -478,7 +479,7 @@ export async function deployPosition({
     throw new Error(`Invalid volatility ${volatility} — refusing deploy because the volatility feed is unusable.`);
   }
 
-  if (isPoolOnCooldown(pool_address)) {
+  if (!skipCooldown && isPoolOnCooldown(pool_address)) {
     log("deploy", `Pool ${pool_address.slice(0, 8)} is on cooldown — skipping`);
     return { success: false, error: "Pool on cooldown — was recently closed with a cooldown reason. Try a different pool." };
   }
@@ -486,7 +487,7 @@ export async function deployPosition({
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
   const pool = await getPool(pool_address);
   const baseMint = pool.lbPair.tokenXMint.toString();
-  if (isBaseMintOnCooldown(baseMint)) {
+  if (!skipCooldown && isBaseMintOnCooldown(baseMint)) {
     log("deploy", `Base mint ${baseMint.slice(0, 8)} is on cooldown — skipping deploy for pool ${pool_address.slice(0, 8)}`);
     return { success: false, error: "Token on cooldown — recently closed out-of-range too many times. Try a different token." };
   }
@@ -825,6 +826,12 @@ export async function deployPosition({
     const signalSnapshot = config.darwin?.enabled
       ? getAndClearStagedSignals(pool_address, baseMint)
       : null;
+    // Always record the entry USD value — needed for IL-aware mark-to-market PnL.
+    // The LLM rarely passes initial_value_usd, so derive it from SOL deposited × price.
+    let entryValueUsd = (initial_value_usd != null && Number.isFinite(Number(initial_value_usd))) ? Number(initial_value_usd) : null;
+    if (entryValueUsd == null) {
+      try { const _bal = await getWalletBalances({}); if (_bal.sol_price > 0) entryValueUsd = Math.round(finalAmountY * _bal.sol_price * 100) / 100; } catch { /* best-effort */ }
+    }
     trackPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
@@ -838,7 +845,7 @@ export async function deployPosition({
       amount_sol: finalAmountY,
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
-      initial_value_usd,
+      initial_value_usd: entryValueUsd,
       signal_snapshot: signalSnapshot,
     });
 
@@ -1247,7 +1254,7 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           log("positions_warn", `Suspicious pnl_pct for ${positionAddress.slice(0, 8)}: reported=${reportedPnlPct.toFixed(2)} derived=${derivedPnlPct.toFixed(2)} diff=${pnlPctDiff.toFixed(2)}`);
         }
 
-        positions.push({
+        const _pos = {
           position:           positionAddress,
           pool:               pool.poolAddress,
           pair:               tracked?.pool_name || `${pool.tokenX}/${pool.tokenY}`,
@@ -1333,7 +1340,29 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
-        });
+        };
+        // ── IL-aware mark-to-market PnL ──────────────────────────────────
+        // Meteora's pnl_usd under-counts impermanent loss (observed: it read
+        // +$2.17 on a position fabriq valued at +$1.03). Recompute PnL as
+        // (current LP value + all fees) − entry deposit, which is IL-aware by
+        // construction, and drive the close rules off the MORE CONSERVATIVE of
+        // the two (never fire take-profit on an IL-inflated number).
+        {
+          const initUsd = Number(tracked?.initial_value_usd);
+          const curVal = Number(_pos.total_value_usd);
+          const feesAll = (Number(_pos.collected_fees_usd) || 0) + (Number(_pos.unclaimed_fees_usd) || 0);
+          if (initUsd > 0 && Number.isFinite(curVal)) {
+            const mtmUsd = Math.round((curVal + feesAll - initUsd) * 10000) / 10000;
+            const mtmPct = Math.round((mtmUsd / initUsd) * 10000) / 100;
+            // INFORMATIONAL ONLY — surfaced for visibility / fee-coverage, NOT used to
+            // drive close rules. A single bad entry-value would otherwise wrongly
+            // liquidate a healthy position (observed: ชั้ง read -31% vs Meteora ~flat).
+            _pos.pnl_usd_mtm = mtmUsd;
+            _pos.pnl_pct_mtm = mtmPct;
+            _pos.il_estimate_usd = Math.round((feesAll - mtmUsd) * 10000) / 10000; // fees − net = IL/price component
+          }
+        }
+        positions.push(_pos);
       }
     }
 
@@ -2053,4 +2082,56 @@ async function lookupPoolForPosition(position_address, walletAddress) {
   }
 
   throw new Error(`Position ${position_address} not found in open positions`);
+}
+
+/**
+ * Re-center a position: close it, swap any base token back to SOL, then redeploy
+ * single-sided SOL around the CURRENT active bin — keeping liquidity active so
+ * fees keep accruing (the core behavior of the studied top performers).
+ *
+ * Bypasses the executor deploy gate (challenger / duplicate-pool) on purpose —
+ * this re-enters an already-vetted pool, not a fresh entry. Single-sided SOL
+ * model means the reclaimed capital redeploys cleanly as amount_y.
+ */
+export async function recenterPosition({ position_address, bins_below, strategy, reason = "recenter (range drifted)" }) {
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, success: true, message: `DRY RUN — would recenter ${position_address}` };
+  }
+  const live = await getMyPositions({ force: true });
+  const pos = (live.positions || []).find((p) => p.position === position_address);
+  if (!pos) return { success: false, error: "position not found" };
+  const tracked = getTrackedPosition(position_address);
+  const poolAddress = pos.pool;
+
+  // 1. Close (removes liquidity + claims fees)
+  const closed = await closePosition({ position_address, reason });
+  if (!closed.success) return { success: false, stage: "close", error: closed.error };
+
+  // 2. Swap any reclaimed base token back to SOL (single-sided redeploy)
+  let swapped = false;
+  const baseMint = closed.base_mint || pos.base_mint;
+  if (baseMint) {
+    try {
+      const bals = await getWalletBalances({});
+      const tk = (bals.tokens || []).find((t) => t.mint === baseMint);
+      if (tk && tk.usd >= 0.10) { await swapToken({ input_mint: baseMint, output_mint: "SOL", amount: tk.balance }); swapped = true; }
+    } catch (e) { log("recenter_warn", `swap base→SOL failed: ${e.message}`); }
+  }
+
+  // 3. Compute redeploy size from reclaimed SOL (minus gas), capped near original
+  const bal = await getWalletBalances({});
+  const deployable = Math.max(0, (bal.sol || 0) - config.management.gasReserve);
+  const cap = tracked?.amount_sol ? tracked.amount_sol * 1.5 : deployable;
+  const amount = Math.min(deployable, cap);
+  if (amount < config.management.minSolToOpen) {
+    return { success: false, stage: "redeploy", error: `insufficient SOL to redeploy (${amount.toFixed(3)})`, closed_pnl_pct: closed.pnl_pct, swapped };
+  }
+
+  // 4. Redeploy single-sided SOL around the CURRENT active bin (deployPosition fetches it)
+  const deployed = await deployPosition({
+    pool_address: poolAddress, amount_y: amount, bins_below, strategy,
+    pool_name: pos.pair, skipCooldown: true,
+  });
+  log("recenter", `${pos.pair}: closed (pnl ${closed.pnl_pct}%) → redeployed ${amount.toFixed(3)} SOL around new active bin (${deployed.success ? "ok" : "FAILED: " + deployed.error})`);
+  return { success: !!deployed.success, recentered: true, closed_pnl_pct: closed.pnl_pct, swapped, deployed };
 }

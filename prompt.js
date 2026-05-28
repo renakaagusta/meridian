@@ -20,15 +20,15 @@ export function buildSystemPrompt(agentType, portfolio, positions, stateSummary 
     const mgmtConfig = JSON.stringify(config.management);
     return `You are an autonomous DLMM LP agent on Meteora, Solana. Role: MANAGER
 
-This is a mechanical rule-application task. All position data is pre-loaded. Apply the close/claim rules directly and output the report. No extended analysis or deliberation required.
+Position close/claim choices are decided by deterministic rules and pre-loaded in the request. Your job is to EXECUTE those actions and handle the one case rules can't: INSTRUCTION positions.
 
 Portfolio: ${portfolioCompact}
 Management Config: ${mgmtConfig}
 
 BEHAVIORAL CORE:
-1. PATIENCE IS PROFIT: Avoid closing positions for tiny gains/losses.
-2. GAS EFFICIENCY: close_position costs gas — only close for clear reasons. After close, swap_token is MANDATORY for any token worth >= $0.10 (dust < $0.10 = skip). Always check token USD value before swapping.
-3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics.
+1. EXECUTE PRE-DECIDED ACTIONS: For CLOSE/CLAIM, the rule already fired — do not re-litigate it. When you call close_position, set reason to the exact rule reason shown (e.g. "low yield", "OOR", "stop loss", "take profit").
+2. INSTRUCTION JUDGMENT: For an INSTRUCTION position, read its note, check get_position_pnl, and compare against the condition. Condition met → close_position immediately. Not met → HOLD, do nothing. This is your only discretionary call.
+3. GAS EFFICIENCY: After any close, swap_token is MANDATORY for any token worth >= $0.10 (dust < $0.10 = skip). Always check token USD value before swapping.
 
 ${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
@@ -129,29 +129,15 @@ NARRATIVE QUALITY (your main judgment call):
 POOL MEMORY: Past losses or problems → strong skip signal.
 
 DEPLOY RULES:
-- COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.
+${config.screening.convictionSizing
+  ? `- CONVICTION SIZING: scale amount_y by conviction — up to 1.5× the goal's deploy amount when smart wallets are present AND fee/TVL is strong; 0.7× for marginal-but-acceptable picks. Never exceed available SOL.`
+  : `- COMPOUNDING: Use the deploy amount from the goal EXACTLY. Do NOT default to a smaller number.`}
 - bins_below = round(config.strategy.minBinsBelow + (candidate volatility/5)*(config.strategy.maxBinsBelow-config.strategy.minBinsBelow)) clamped to [minBinsBelow,maxBinsBelow]. Volatility must be a positive number; 0/unknown means skip.
 - Use amount_y only, keep amount_x=0 and bins_above=0.
 - Bin steps must be [80-125].
 - Pick ONE pool only when conviction is real. If only one weak candidate survives, skip and explain why none qualify.
 
-${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
-`;
-  } else if (agentType === "MANAGER") {
-    basePrompt += `
-Your goal: Manage positions to maximize total Fee + PnL yield.
-
-INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately. No further analysis, no hesitation. BIAS TO HOLD does NOT apply when an instruction condition is met.
-
-BIAS TO HOLD: Unless an instruction fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
-
-Decision Factors for Closing (no instruction):
-- Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?
-- Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back?
-- Opportunity Cost: Only close to "free up SOL" if you see a significantly better pool that justifies the gas cost of exiting and re-entering.
-
-IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
-After ANY close: check wallet for base tokens and swap ALL to SOL immediately.
+${decisionSummary ? `RECENT DECISIONS (avoid re-deploying into pools just rejected unless new evidence):\n${decisionSummary}\n\n` : ""}${weightsSummary ? `${weightsSummary}\nPrioritize candidates whose strongest attributes align with high-weight signals.\n\n` : ""}${lessons ? `LESSONS LEARNED:\n${lessons}\n` : ""}Timestamp: ${new Date().toISOString()}
 `;
   } else {
     basePrompt += `

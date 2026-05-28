@@ -267,6 +267,25 @@ WARNING: This executes a real on-chain transaction.`,
   {
     type: "function",
     function: {
+      name: "recenter_position",
+      description: `Re-center a position around the CURRENT active bin to keep liquidity earning fees.
+It closes the position, swaps any base token back to SOL, and redeploys single-sided SOL around the new active bin (same pool).
+Use when a position has drifted off the active bin (price moved) but the pool is still healthy — instead of closing dead.
+This is how top LP performers keep fees flowing. Executes real on-chain transactions.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: { type: "string", description: "The position public key to re-center" },
+          bins_below: { type: "number", description: "Optional bins below active bin for the new range; defaults to the configured strategy default." },
+        },
+        required: ["position_address"],
+      },
+    },
+  },
+
+  {
+    type: "function",
+    function: {
       name: "close_position",
       description: `Remove all liquidity and close a position.
 This withdraws all tokens back to the wallet and closes the position account.

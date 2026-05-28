@@ -1,6 +1,20 @@
 import fs from "fs";
 import path from "path";
+import net from "net";
+import dns from "dns";
 import { fileURLToPath } from "url";
+
+// ── Node 20 Happy-Eyeballs fix ──────────────────────────────────
+// Node's autoSelectFamily races IPv4 and IPv6 with a 250ms per-attempt timeout.
+// On networks where a host's IPv6 (e.g. NAT64 64:ff9b::) is dead, Node bails in
+// ~250ms with ETIMEDOUT before IPv4 can connect — breaking fetch() to hosts that
+// curl reaches fine (observed with api.minimax.io). Prefer IPv4 and give each
+// attempt room. Override with NET_FAMILY_ATTEMPT_TIMEOUT_MS.
+try {
+  const attemptMs = Number(process.env.NET_FAMILY_ATTEMPT_TIMEOUT_MS) || 2500;
+  net.setDefaultAutoSelectFamilyAttemptTimeout?.(attemptMs);
+  dns.setDefaultResultOrder?.("ipv4first");
+} catch { /* older Node — best effort */ }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
@@ -73,6 +87,9 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    maxVolatility:     u.maxVolatility     ?? null, // null = no ceiling; auto-tuner sets/raises it from outcomes
+    challengerEnabled: u.challengerEnabled ?? true, // run a devil's-advocate LLM pass before every deploy
+    convictionSizing:  u.convictionSizing  ?? false, // scale deploy size by conviction (smart wallets + fee/TVL); off by default
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
@@ -104,6 +121,13 @@ export const config = {
     repeatDeployCooldownScope: u.repeatDeployCooldownScope ?? "token", // pool | token | both
     repeatDeployCooldownMinFeeEarnedPct: u.repeatDeployCooldownMinFeeEarnedPct ?? u.repeatDeployCooldownMinFeeYieldPct ?? 0,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
+    // Hard exits (stop-loss / pumped-far-above) close immediately from the 30s
+    // poller — bypassing the LLM cycle and the per-interval cooldown.
+    fastEmergencyClose:    u.fastEmergencyClose    ?? true,
+    // Re-centering (learned from top performers: re-add around active bin to keep liquidity earning).
+    // Default OFF — untested on-chain; enable + watch the first one before trusting it.
+    recenterEnabled:       u.recenterEnabled       ?? false,
+    maxRecentersPerPosition: u.maxRecentersPerPosition ?? 3,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
@@ -134,6 +158,13 @@ export const config = {
     managementIntervalMin:  u.managementIntervalMin  ?? 10,
     screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
     healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
+    evaluatorIntervalHours: u.evaluatorIntervalHours ?? 0, // 0 = disabled (run manually via /evaluator)
+  },
+
+  // ─── Web decision visualizer ────────────
+  web: {
+    enabled: u.webEnabled ?? (process.env.WEB_VIZ !== "false"),
+    port:    Number(process.env.WEB_PORT ?? u.webPort ?? 8420),
   },
 
   // ─── LLM Settings ──────────────────────
@@ -144,6 +175,15 @@ export const config = {
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
     generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    challengerModel: u.challengerModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
+    evaluatorModel: u.evaluatorModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    compressorModel: u.compressorModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+  },
+
+  // ─── Memory compressor ────────────────────
+  compressor: {
+    lessonThreshold: u.compressorLessonThreshold ?? 10, // compress a role once it has > this many compressible lessons
+    targetCount:     u.compressorTargetCount     ?? 6,  // merge down to at most this many
   },
 
   // ─── Darwinian Signal Weighting ───────
@@ -167,6 +207,8 @@ export const config = {
 
   // ─── HiveMind ─────────────────────────
   hiveMind: {
+    // mode: "live" (sync normally) | "log" (no network in/out, only log would-be sends) | "off" (fully disabled)
+    mode: nonEmptyString(u.hiveMindMode, process.env.HIVEMIND_MODE, "live"),
     url: nonEmptyString(u.hiveMindUrl, DEFAULT_HIVEMIND_URL),
     apiKey: nonEmptyString(u.hiveMindApiKey, process.env.HIVEMIND_API_KEY, DEFAULT_HIVEMIND_API_KEY),
     agentId: u.agentId ?? null,
@@ -254,6 +296,7 @@ export function reloadScreeningThresholds() {
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
+    if (fresh.maxVolatility  !== undefined) s.maxVolatility = fresh.maxVolatility;
     if (fresh.timeframe         != null) s.timeframe         = fresh.timeframe;
     if (fresh.category          != null) s.category          = fresh.category;
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;

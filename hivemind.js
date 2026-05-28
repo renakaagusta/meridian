@@ -8,6 +8,7 @@ import { config } from "./config.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 const CACHE_PATH = path.join(__dirname, "hivemind-cache.json");
+const OUTBOUND_LOG_PATH = path.join(__dirname, "hivemind-outbound.jsonl");
 const PACKAGE_JSON_PATH = path.join(__dirname, "package.json");
 const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;
 
@@ -84,8 +85,30 @@ export function getHiveMindPullMode() {
   return getPullMode();
 }
 
+// "live" = sync over network; "log" = log would-be outbound, no network, no inbound influence; "off" = fully silent
+function getMode() {
+  const mode = sanitizeText(config.hiveMind?.mode || "live", 12) || "live";
+  return ["off", "log", "live"].includes(mode) ? mode : "live";
+}
+
+export function getHiveMindMode() {
+  return getMode();
+}
+
+// Network sync only happens in live mode (and only when a URL + key are present).
 export function isHiveMindEnabled() {
-  return !!(getBaseUrl() && getApiKey());
+  return getMode() === "live" && !!(getBaseUrl() && getApiKey());
+}
+
+// In log mode, persist the payload we would have sent so it can be audited locally.
+function recordOutbound(kind, payload) {
+  const entry = { ts: new Date().toISOString(), kind, payload };
+  try {
+    fs.appendFileSync(OUTBOUND_LOG_PATH, `${JSON.stringify(entry)}\n`);
+  } catch (error) {
+    log("hivemind_warn", `Failed to write outbound log: ${error.message}`);
+  }
+  log("hivemind_logonly", `Logged (not sent) ${kind}`);
 }
 
 export function ensureAgentId() {
@@ -151,6 +174,8 @@ function normalizeSharedLesson(lesson) {
 }
 
 export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 6 } = {}) {
+  // Only live mode lets HiveMind data influence decisions. log/off → never inject (even stale cache).
+  if (getMode() !== "live") return null;
   const role = String(agentType || "GENERAL").toUpperCase();
   const shared = (readCache().sharedLessons || [])
     .map(normalizeSharedLesson)
@@ -166,22 +191,25 @@ export function getSharedLessonsForPrompt({ agentType = "GENERAL", maxLessons = 
 }
 
 export async function registerHiveMindAgent({ reason = "heartbeat" } = {}) {
+  if (getMode() === "off") return null;
+  const body = {
+    agentId: getAgentId(),
+    version: AGENT_VERSION,
+    timestamp: new Date().toISOString(),
+    reason,
+    capabilities: {
+      telegram: !!process.env.TELEGRAM_BOT_TOKEN,
+      lpagent: !!process.env.LPAGENT_API_KEY,
+      dryRun: process.env.DRY_RUN === "true",
+    },
+  };
+  if (getMode() === "log") {
+    recordOutbound("agent_register", body);
+    return null;
+  }
   if (!isHiveMindEnabled()) return null;
   try {
-    return await requestJson("/api/hivemind/agents/register", {
-      method: "POST",
-      body: {
-        agentId: getAgentId(),
-        version: AGENT_VERSION,
-        timestamp: new Date().toISOString(),
-        reason,
-        capabilities: {
-          telegram: !!process.env.TELEGRAM_BOT_TOKEN,
-          lpagent: !!process.env.LPAGENT_API_KEY,
-          dryRun: process.env.DRY_RUN === "true",
-        },
-      },
-    });
+    return await requestJson("/api/hivemind/agents/register", { method: "POST", body });
   } catch (error) {
     log("hivemind_warn", `Agent register failed: ${error.message}`);
     return null;
@@ -225,21 +253,23 @@ export async function pullHiveMindPresets() {
 }
 
 export async function bootstrapHiveMind() {
-  if (!isHiveMindEnabled()) return null;
+  const mode = getMode();
+  if (mode === "off") return null;
   ensureAgentId();
   const tasks = [registerHiveMindAgent({ reason: "startup" })];
-  if (getPullMode() === "auto") {
+  if (mode === "live" && getPullMode() === "auto") {
     tasks.push(pullHiveMindLessons(), pullHiveMindPresets());
   }
   await Promise.allSettled(tasks);
-  return { enabled: true, agentId: getAgentId(), pullMode: getPullMode() };
+  return { enabled: mode === "live", mode, agentId: getAgentId(), pullMode: getPullMode() };
 }
 
 export function startHiveMindBackgroundSync() {
-  if (!isHiveMindEnabled() || _heartbeatTimer) return null;
+  const mode = getMode();
+  if (mode === "off" || _heartbeatTimer) return null;
   _heartbeatTimer = setInterval(() => {
     const tasks = [registerHiveMindAgent({ reason: "heartbeat" })];
-    if (getPullMode() === "auto") {
+    if (mode === "live" && getPullMode() === "auto") {
       tasks.push(pullHiveMindLessons(), pullHiveMindPresets());
     }
     Promise.allSettled(tasks).catch(() => null);
@@ -290,9 +320,14 @@ function inferLessonSourceType(lesson) {
 }
 
 export async function pushHiveLesson(lesson) {
-  if (!isHiveMindEnabled()) return null;
+  if (getMode() === "off") return null;
   const body = buildLessonEvent(lesson);
   if (!body) return null;
+  if (getMode() === "log") {
+    recordOutbound("lesson_push", body);
+    return null;
+  }
+  if (!isHiveMindEnabled()) return null;
   try {
     return await requestJson("/api/hivemind/lessons/push", {
       method: "POST",
@@ -315,30 +350,33 @@ function shouldCountInAdjustedWinRate(closeReason) {
 }
 
 export async function pushHivePerformanceEvent(perf) {
+  if (getMode() === "off") return null;
+  const body = {
+    eventId: sanitizeText(perf.eventId, 200) || `close:${getAgentId()}:${perf.position || perf.pool}:${perf.recorded_at || Date.now()}`,
+    agentId: getAgentId(),
+    version: AGENT_VERSION,
+    timestamp: perf.recorded_at || new Date().toISOString(),
+    event: {
+      pool: sanitizeText(perf.pool, 64) || null,
+      poolName: sanitizeText(perf.pool_name, 80) || null,
+      baseMint: sanitizeText(perf.base_mint, 64) || null,
+      strategy: sanitizeText(perf.strategy, 32) || null,
+      closeReason: sanitizeText(perf.close_reason, 200) || "unknown",
+      pnlUsd: Number(perf.pnl_usd || 0),
+      pnlPct: Number(perf.pnl_pct || 0),
+      feesUsd: Number(perf.fees_earned_usd || 0),
+      feesSol: Number(perf.fees_earned_sol || 0),
+      minutesHeld: Number(perf.minutes_held || 0),
+      countInAdjustedWinRate: shouldCountInAdjustedWinRate(perf.close_reason),
+    },
+  };
+  if (getMode() === "log") {
+    recordOutbound("performance_push", body);
+    return null;
+  }
   if (!isHiveMindEnabled()) return null;
   try {
-    return await requestJson("/api/hivemind/performance/push", {
-      method: "POST",
-      body: {
-        eventId: sanitizeText(perf.eventId, 200) || `close:${getAgentId()}:${perf.position || perf.pool}:${perf.recorded_at || Date.now()}`,
-        agentId: getAgentId(),
-        version: AGENT_VERSION,
-        timestamp: perf.recorded_at || new Date().toISOString(),
-        event: {
-          pool: sanitizeText(perf.pool, 64) || null,
-          poolName: sanitizeText(perf.pool_name, 80) || null,
-          baseMint: sanitizeText(perf.base_mint, 64) || null,
-          strategy: sanitizeText(perf.strategy, 32) || null,
-          closeReason: sanitizeText(perf.close_reason, 200) || "unknown",
-          pnlUsd: Number(perf.pnl_usd || 0),
-          pnlPct: Number(perf.pnl_pct || 0),
-          feesUsd: Number(perf.fees_earned_usd || 0),
-          feesSol: Number(perf.fees_earned_sol || 0),
-          minutesHeld: Number(perf.minutes_held || 0),
-          countInAdjustedWinRate: shouldCountInAdjustedWinRate(perf.close_reason),
-        },
-      },
-    });
+    return await requestJson("/api/hivemind/performance/push", { method: "POST", body });
   } catch (error) {
     log("hivemind_warn", `Performance push failed: ${error.message}`);
     return null;

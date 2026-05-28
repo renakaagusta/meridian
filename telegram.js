@@ -123,29 +123,55 @@ async function postTelegramRaw(method, body) {
   }
 }
 
+// ── Universal sender attribution ────────────────────────────────
+// Every outbound message is stamped with WHO sent it, in bold. If the text
+// already carries an agent tag like [SCREENER], that tag is bolded in place;
+// otherwise a bold "🤖 [SENDER]" header is prepended (SENDER = active context).
+let _activeSender = "MERIDIAN";
+export function setActiveSender(label) {
+  _activeSender = (label ? String(label).toUpperCase().replace(/[^A-Z]/g, "") : "") || "MERIDIAN";
+}
+const _AGENT_TAG = /\[(SCREENER|MANAGER|CHALLENGER|EVALUATOR|COMPRESSOR|MERIDIAN|AGENT|BRIEFING|HEALTH)\]/;
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+// For plain-text callers: escape body, then bold the sender tag (existing or prepended).
+function formatPlain(text) {
+  const t = String(text);
+  const m = t.slice(0, 120).match(_AGENT_TAG);
+  let body = escapeHtml(t);
+  if (m) body = body.replace(`[${m[1]}]`, `<b>[${m[1]}]</b>`);
+  else body = `🤖 <b>[${_activeSender}]</b>\n${body}`;
+  return { text: body.slice(0, 4096), parse_mode: "HTML" };
+}
+
 export async function sendMessage(text) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
+  return postTelegram("sendMessage", formatPlain(text));
 }
 
 export async function sendMessageWithButtons(text, inlineKeyboard) {
   if (!TOKEN || !chatId) return;
   return postTelegram("sendMessage", {
-    text: String(text).slice(0, 4096),
+    ...formatPlain(text),
     reply_markup: { inline_keyboard: inlineKeyboard },
   });
 }
 
 export async function sendHTML(html) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+  // Body is intentional HTML — don't escape. Add a bold sender unless already tagged.
+  const h = /<b>\[/.test(String(html).slice(0, 40)) || _AGENT_TAG.test(String(html).slice(0, 60))
+    ? html
+    : `🤖 <b>[${_activeSender}]</b>\n${html}`;
+  return postTelegram("sendMessage", { text: h.slice(0, 4096), parse_mode: "HTML" });
 }
 
 export async function editMessage(text, messageId) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
-    text: String(text).slice(0, 4096),
+    ...formatPlain(text),
   });
 }
 
@@ -153,7 +179,7 @@ export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
-    text: String(text).slice(0, 4096),
+    ...formatPlain(text),
     reply_markup: { inline_keyboard: inlineKeyboard },
   });
 }
@@ -411,7 +437,7 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
     ? `Bin step: ${binStep ?? "?"}  |  Base fee: ${baseFee != null ? baseFee + "%" : "?"}\n`
     : "";
   await sendHTML(
-    `✅ <b>Deployed</b> ${pair}\n` +
+    `🔍 <b>[SCREENER]</b> 🚀 Deployed ${pair}\n` +
     `Amount: ${amountSol} SOL\n` +
     priceStr +
     coverageStr +
@@ -425,7 +451,7 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
   if (hasActiveLiveMessage()) return;
   const sign = pnlUsd >= 0 ? "+" : "";
   await sendHTML(
-    `🔒 <b>Closed</b> ${pair}\n` +
+    `🔄 <b>[MANAGER]</b> 🔒 Closed ${pair}\n` +
     `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
   );
 }
@@ -433,7 +459,7 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
 export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
-    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
+    `🔄 <b>[MANAGER]</b> 💱 Swapped ${inputSymbol} → ${outputSymbol}\n` +
     `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
     `Tx: <code>${tx?.slice(0, 16)}...</code>`
   );
@@ -442,8 +468,18 @@ export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOu
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   if (hasActiveLiveMessage()) return;
   await sendHTML(
-    `⚠️ <b>Out of Range</b> ${pair}\n` +
+    `🔄 <b>[MANAGER]</b> ⚠️ Out of Range ${pair}\n` +
     `Been OOR for ${minutesOOR} minutes`
+  );
+}
+
+// Standalone challenger verdict — intentionally NOT suppressed during a live
+// cycle message, so vetoes get their own clearly-labelled [CHALLENGER] message.
+export async function notifyChallenger({ pool, confidence, reason }) {
+  await sendHTML(
+    `🛡️ <b>[CHALLENGER]</b> ⛔ Veto ${pool || ""}\n` +
+    `confidence: ${confidence ?? "?"}\n` +
+    `${reason || ""}`
   );
 }
 

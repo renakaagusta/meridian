@@ -1,6 +1,7 @@
 import "./envcrypt.js";
 import cron from "node-cron";
 import readline from "readline";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { agentLoop } from "./agent.js";
@@ -23,6 +24,7 @@ import {
   notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
+  setActiveSender,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, getTrackedPositions, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
@@ -34,6 +36,10 @@ import { stageSignals } from "./signal-tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { runEvaluatorReview, applyEvaluatorProposal } from "./evaluator.js";
+import { compressIfNeeded, compressAgentMemory } from "./compressor.js";
+import { appendTrace } from "./decision-trace.js";
+import { runConnectivityCheck } from "./diagnostics.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const isMain = entrypointPath
@@ -47,6 +53,15 @@ if (isMain) {
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
+  if (config.web?.enabled) {
+    import("./server.js")
+      .then(({ startWebServer }) => startWebServer(config.web.port))
+      .catch((error) => log("web_warn", `Visualizer failed to start: ${error.message}`));
+  }
+  // Boot-time connectivity check — surfaces unreachable services before the first cycle.
+  runConnectivityCheck()
+    .then(({ text }) => console.log("\n" + text + "\n"))
+    .catch((error) => log("diag_warn", `Connectivity check failed: ${error.message}`));
 }
 
 const TP_PCT = config.management.takeProfitPct;
@@ -197,6 +212,7 @@ function stopCronJobs() {
 }
 
 export async function runManagementCycle({ silent = false } = {}) {
+  setActiveSender("MANAGER");
   if (_managementBusy) return null;
   _managementBusy = true;
   timers.managementLastRun = Date.now();
@@ -208,7 +224,7 @@ export async function runManagementCycle({ silent = false } = {}) {
 
   try {
     if (!silent && telegramEnabled()) {
-      liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
+      liveMessage = await createLiveMessage("🔄 [MANAGER] Management Cycle", "Evaluating positions...");
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
@@ -220,10 +236,15 @@ export async function runManagementCycle({ silent = false } = {}) {
       return mgmtReport;
     }
 
-    // Snapshot + load pool memory
+    // Snapshot + load pool memory + IL/fee-coverage (the winners' real decision variable:
+    // are fees outpacing impermanent loss?). priceIl = PnL minus fees = price move + IL.
     const positionData = positions.map((p) => {
       recordPositionSnapshot(p.pool, p);
-      return { ...p, recall: recallForPool(p.pool) };
+      const fees = (p.collected_fees_usd || 0) + (p.unclaimed_fees_usd || 0);
+      const priceIl = (p.pnl_usd || 0) - fees;          // negative = IL/price loss
+      const ilLoss = priceIl < 0 ? -priceIl : 0;
+      const fee_coverage = ilLoss > 0.001 ? Math.round((fees / ilLoss) * 100) / 100 : null; // null = no IL loss (winning on price)
+      return { ...p, recall: recallForPool(p.pool), fees_total_usd: Math.round(fees * 1e4) / 1e4, il_loss_usd: Math.round(ilLoss * 1e4) / 1e4, fee_coverage };
     });
 
     // JS trailing TP check
@@ -287,7 +308,8 @@ export async function runManagementCycle({ silent = false } = {}) {
       const val = config.management.solMode ? `◎${p.total_value_usd ?? "?"}` : `$${p.total_value_usd ?? "?"}`;
       const unclaimed = config.management.solMode ? `◎${p.unclaimed_fees_usd ?? "?"}` : `$${p.unclaimed_fees_usd ?? "?"}`;
       const statusLabel = act.action === "INSTRUCTION" ? "HOLD (instruction)" : act.action;
-      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | ${inRange} | ${statusLabel}`;
+      const cov = p.fee_coverage == null ? (p.il_loss_usd > 0 ? "—" : "fees+price✓") : `${p.fee_coverage}× fees/IL${p.fee_coverage >= 1 ? "✓" : "⚠️"}`;
+      let line = `**${p.pair}** | Age: ${p.age_minutes ?? "?"}m | Val: ${val} | Unclaimed: ${unclaimed} | PnL: ${p.pnl_pct ?? "?"}% | Yield: ${p.fee_per_tvl_24h ?? "?"}% | Cov: ${cov} | ${inRange} | ${statusLabel}`;
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
@@ -319,24 +341,25 @@ export async function runManagementCycle({ silent = false } = {}) {
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
           `  action: ${act.action}${act.rule && act.rule !== "exit" ? ` — Rule ${act.rule}: ${act.reason}` : ""}${act.rule === "exit" ? ` — ⚡ Trailing TP: ${act.reason}` : ""}`,
-          `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}%`,
+          `  pnl_pct: ${p.pnl_pct}% | unclaimed_fees: ${cur}${p.unclaimed_fees_usd} | value: ${cur}${p.total_value_usd} | fee_per_tvl_24h: ${p.fee_per_tvl_24h ?? "?"}% | fees_vs_IL: ${p.fee_coverage == null ? (p.il_loss_usd > 0 ? "n/a" : "no IL (price+)") : p.fee_coverage + "× (fees $" + p.fees_total_usd + " vs IL $" + p.il_loss_usd + ")"}`,
           `  bins: lower=${p.lower_bin} upper=${p.upper_bin} active=${p.active_bin} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
         ].filter(Boolean).join("\n");
       }).join("\n\n");
 
-      const { content } = await agentLoop(`
+      const { content, transcript } = await agentLoop(`
 MANAGEMENT ACTION REQUIRED — ${actionPositions.length} position(s)
 
 ${actionBlocks}
 
 RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
+- RECENTER: call recenter_position with the position address — it closes and redeploys single-sided SOL around the current active bin to keep liquidity earning fees. Do NOT also call close_position.
 - CLAIM: call claim_fees with position address
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
 - ⚡ exit alerts: close immediately, no exceptions
 
-Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM — rules already applied. Just execute.
+Execute the required actions. Do NOT re-evaluate CLOSE/CLAIM/RECENTER — rules already applied. Just execute.
 After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048, {
         onToolStart: async ({ name }) => { await liveMessage?.toolStart(name); },
@@ -344,6 +367,38 @@ After executing, write a brief one-line result per position.
       });
 
       mgmtReport += `\n\n${content}`;
+
+      // ── Full decision trace: position state, the rules that fired, and the run ──
+      appendTrace({
+        cycle: "management",
+        actor: "MANAGER",
+        inputs: {
+          positions: positionData.map((p) => ({
+            pair: p.pair,
+            pool: p.pool,
+            position: p.position,
+            pnl_pct: p.pnl_pct,
+            unclaimed_fees_usd: p.unclaimed_fees_usd,
+            total_value_usd: p.total_value_usd,
+            fee_per_tvl_24h: p.fee_per_tvl_24h,
+            in_range: p.in_range,
+            minutes_out_of_range: p.minutes_out_of_range,
+            instruction: p.instruction || null,
+            rule: actionMap.get(p.position),
+            recall: p.recall || null,
+          })),
+          actions_required: actionPositions.map((p) => p.position),
+          // Exact management thresholds that produced the close/claim rules above.
+          config_snapshot: { management: { ...config.management } },
+        },
+        transcript,
+        final_content_raw: content,
+        final_content: stripThink(content),
+        decision: {
+          type: "management",
+          summary: actionSummary,
+        },
+      });
     } else {
       log("cron", "Management: all positions STAY — skipping LLM");
       await liveMessage?.note("No tool actions needed.");
@@ -364,7 +419,7 @@ After executing, write a brief one-line result per position.
     if (!silent && telegramEnabled()) {
       if (mgmtReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
-        else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
+        else sendMessage(`🔄 [MANAGER] Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
       }
       for (const p of positions) {
         if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
@@ -377,6 +432,7 @@ After executing, write a brief one-line result per position.
 }
 
 export async function runScreeningCycle({ silent = false } = {}) {
+  setActiveSender("SCREENER");
   if (_screeningBusy) {
     log("cron", "Screening skipped — previous cycle still running");
     return null;
@@ -423,7 +479,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     return screenReport;
   }
   if (!silent && telegramEnabled()) {
-    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
+    liveMessage = await createLiveMessage("🔍 [SCREENER] Screening Cycle", "Scanning candidates...");
   }
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
@@ -481,6 +537,12 @@ export async function runScreeningCycle({ silent = false } = {}) {
       if (botPct != null && maxBotHoldersPct != null && botPct > maxBotHoldersPct) {
         log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
         filteredOut.push({ name: pool.name, reason: `bot holders ${botPct}% > ${maxBotHoldersPct}%` });
+        return false;
+      }
+      const maxVol = config.screening.maxVolatility;
+      if (Number.isFinite(maxVol) && Number.isFinite(pool.volatility) && pool.volatility > maxVol) {
+        log("screening", `Volatility filter: dropped ${pool.name} — volatility ${pool.volatility} > ${maxVol} (learned ceiling)`);
+        filteredOut.push({ name: pool.name, reason: `volatility ${pool.volatility} > ${maxVol} (learned ceiling)` });
         return false;
       }
       return true;
@@ -572,9 +634,20 @@ export async function runScreeningCycle({ silent = false } = {}) {
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
         : null;
 
+      // Momentum / exhaustion signals — fetched by screening.js but previously dropped.
+      const momentumParts = [
+        pool.volume_change_pct != null ? `volΔ=${pool.volume_change_pct}%` : null,
+        pool.fee_change_pct    != null ? `feeΔ=${pool.fee_change_pct}%`    : null,
+        pool.swap_count        != null ? `swaps=${pool.swap_count}`         : null,
+        pool.unique_traders    != null ? `traders=${pool.unique_traders}`  : null,
+        pool.active_pct        != null ? `active_lp=${pool.active_pct}%`    : null,
+        pool.price_trend                ? `trend=${pool.price_trend}`       : null,
+      ].filter(Boolean).join(", ");
+
       const block = [
         `POOL: ${pool.name} (${pool.pool})`,
         `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.tvl ?? pool.active_tvl}, volatility_${pool.volatility_timeframe || "30m"}=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}${pool.token_age_hours != null ? `, age=${pool.token_age_hours}h` : ""}`,
+        momentumParts ? `  momentum: ${momentumParts} (negative volΔ/feeΔ = exhaustion → prefer fresher pools)` : null,
         `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
         pvpLine,
         okxParts ? `  okx: ${okxParts}` : okxUnavailable ? `  okx: unavailable` : null,
@@ -610,7 +683,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     let deployAttempted = false;
     let deploySucceeded = false;
-    const { content } = await agentLoop(`
+    let deployResult = null;
+    let deployArgs = null;
+    const { content, transcript } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
@@ -686,10 +761,11 @@ IMPORTANT:
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
         },
-        onToolFinish: async ({ name, result, success }) => {
+        onToolFinish: async ({ name, args, result, success }) => {
           if (name === "deploy_position") {
             deployAttempted = true;
             deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            if (deploySucceeded) { deployResult = result; deployArgs = args; }
           }
           await liveMessage?.toolFinish(name, result, success);
         },
@@ -709,7 +785,85 @@ IMPORTANT:
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
         reason: stripThink(content).slice(0, 500),
       });
+    } else {
+      // Successful deploy — capture the rationale ("WHY THIS WON") so the loop is auditable.
+      const clean = stripThink(content);
+      const whyMatch = clean.match(/WHY THIS WON\s*\n([\s\S]*?)(?:\n\s*\n|$)/i);
+      appendDecision({
+        type: "deploy",
+        actor: "SCREENER",
+        pool: deployResult?.pool || deployResult?.pool_address || null,
+        pool_name: deployResult?.pool_name || null,
+        position: deployResult?.position || null,
+        summary: `Deployed ${deployResult?.pool_name || deployResult?.pool_address?.slice(0, 8) || "position"}`,
+        reason: (whyMatch ? whyMatch[1] : clean).trim().slice(0, 500),
+        metrics: {
+          amount_sol: deployAmount,
+          bin_step: deployResult?.bin_step ?? null,
+          range_coverage: deployResult?.range_coverage ?? null,
+        },
+      });
+
+      // Auto-tighten the management cadence to the deployed pool's volatility
+      // (deterministic — the prompt rule for this was never executed by the LLM).
+      try {
+        const vol = Number(deployArgs?.volatility);
+        const newInterval = Number.isFinite(vol) ? (vol >= 5 ? 3 : vol >= 2 ? 5 : 10) : null;
+        if (newInterval && newInterval !== config.schedule.managementIntervalMin) {
+          const prev = config.schedule.managementIntervalMin;
+          config.schedule.managementIntervalMin = newInterval;
+          try {
+            const ucPath = "./user-config.json";
+            const uc = fs.existsSync(ucPath) ? JSON.parse(fs.readFileSync(ucPath, "utf8")) : {};
+            uc.managementIntervalMin = newInterval;
+            fs.writeFileSync(ucPath, JSON.stringify(uc, null, 2));
+          } catch { /* best-effort persist */ }
+          startCronJobs(); // apply the new cadence immediately
+          log("cron", `Post-deploy: management cadence ${prev}m → ${newInterval}m (volatility ${vol})`);
+        }
+      } catch (e) { log("cron_warn", `Post-deploy interval adjust failed: ${e.message}`); }
     }
+
+    // ── Full decision trace: everything the screener saw + did ──
+    appendTrace({
+      cycle: "screening",
+      actor: "SCREENER",
+      inputs: {
+        wallet_sol: currentBalance.sol,
+        deploy_amount: deployAmount,
+        positions: `${prePositions.total_positions}/${config.risk.maxPositions}`,
+        strategy: strategyBlock,
+        weights_summary: weightsSummary,
+        // Exact thresholds active at decision time — config mutates via evolve/evaluator.
+        config_snapshot: {
+          screening: { ...config.screening },
+          strategy: { ...config.strategy },
+          risk: { ...config.risk },
+        },
+        candidates_considered: passing.length,
+        candidates: passing.map(({ pool, sw, n, ti, mem }) => ({
+          ...pool,
+          _smart_wallets: sw?.in_pool?.map((w) => w.name) || [],
+          _narrative: n?.narrative || null,
+          _audit: ti?.audit || null,
+          _memory: mem || null,
+        })),
+        filtered: filteredOut,
+        early_filtered: earlyFilteredExamples,
+      },
+      transcript,
+      final_content_raw: content,
+      final_content: stripThink(content),
+      decision: {
+        type: deploySucceeded ? "deploy" : "no_deploy",
+        summary: deploySucceeded
+          ? `Deployed ${deployResult?.pool_name || deployResult?.pool_address?.slice(0, 8) || "position"}`
+          : "No deploy",
+        pool: deployResult?.pool || null,
+        pool_name: deployResult?.pool_name || null,
+        position: deployResult?.position || null,
+      },
+    });
   } catch (error) {
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
@@ -718,7 +872,7 @@ IMPORTANT:
     if (!silent && telegramEnabled()) {
       if (screenReport) {
         if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
-        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
+        else sendMessage(`🔍 [SCREENER] Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
       }
     }
   }
@@ -801,6 +955,23 @@ Summarize the current portfolio health, total fees earned, and performance of al
         }
         const closeRule = getDeterministicCloseRule(p, config.management);
         if (closeRule) {
+          // HARD exits (stop-loss=1, pumped far above range=3) close IMMEDIATELY,
+          // deterministically, no LLM and no cooldown — protects against fast dumps
+          // that a 10-min cycle would miss.
+          const isHard = closeRule.rule === 1 || closeRule.rule === 3;
+          if (isHard && config.management.fastEmergencyClose !== false) {
+            log("state", `[PnL poll] ⚡ HARD exit ${p.pair} — Rule ${closeRule.rule}: ${closeRule.reason} — closing immediately (no LLM)`);
+            _managementBusy = true;
+            try {
+              const res = await executeTool("close_position", { position_address: p.position, reason: closeRule.reason });
+              log("state", `[PnL poll] emergency close ${p.pair}: ${res?.success === false ? "FAILED " + res.error : "ok"}`);
+            } catch (e) {
+              log("cron_error", `Emergency close failed for ${p.pair}: ${e.message}`);
+            } finally {
+              _managementBusy = false;
+            }
+            break;
+          }
           const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
           const sinceLastTrigger = Date.now() - _pollTriggeredAt;
           if (sinceLastTrigger >= cooldownMs) {
@@ -819,9 +990,28 @@ Summarize the current portfolio health, total fees earned, and performance of al
   }, 30_000);
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+
+  // Evaluator meta-review (propose-only) — opt-in via evaluatorIntervalHours > 0
+  const evalHours = Number(config.schedule.evaluatorIntervalHours) || 0;
+  if (evalHours > 0) {
+    const orchTask = cron.schedule(`0 */${Math.max(1, Math.round(evalHours))} * * *`, async () => {
+      try {
+        setActiveSender("EVALUATOR");
+        const { summary } = await runEvaluatorReview({ trigger: "cron" });
+        if (telegramEnabled()) sendMessage(summary).catch(() => {});
+        // Auto-maintain memory: compress any role that has grown noisy (backs up first).
+        const compressed = await compressIfNeeded().catch(() => []);
+        for (const r of compressed) log("compressor", `auto-compressed ${r.role}: ${r.removed}→${r.added}`);
+      } catch (e) {
+        log("cron_error", `Evaluator review failed: ${e.message}`);
+      }
+    });
+    _cronTasks.push(orchTask);
+  }
+
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m${evalHours > 0 ? `, evaluator every ${evalHours}h` : ""}`);
 }
 
 // ═══════════════════════════════════════════
@@ -915,6 +1105,11 @@ function getDeterministicCloseRule(position, managementConfig) {
     position.upper_bin != null &&
     position.active_bin > position.upper_bin + managementConfig.outOfRangeBinsToClose
   ) {
+    // Top performers re-center (redeploy around the new active bin) rather than
+    // abandon a position that drifted while the pool is still alive. Opt-in.
+    if (managementConfig.recenterEnabled) {
+      return { action: "RECENTER", rule: 3, reason: "pumped above range — recenter to keep earning fees" };
+    }
     return { action: "CLOSE", rule: 3, reason: "pumped far above range" };
   }
   if (
@@ -1438,6 +1633,55 @@ async function telegramHandler(msg) {
     return;
   }
 
+  if (text === "/diag" || text === "/health") {
+    await sendMessage("🩺 Running connectivity check…").catch(() => {});
+    try {
+      const { text: report } = await runConnectivityCheck();
+      await sendMessage(report).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Diagnostics failed: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/evaluator" || text.startsWith("/evaluator ")) {
+    setActiveSender("EVALUATOR");
+    const arg = text.slice("/evaluator".length).trim();
+    if (arg.startsWith("apply")) {
+      const id = arg.slice("apply".length).trim() || null;
+      const res = applyEvaluatorProposal(id);
+      await sendMessage(res.ok ? `✅ ${res.message}` : `⚠️ ${res.message}`).catch(() => {});
+      return;
+    }
+    await sendMessage("🧭 Running evaluator review…").catch(() => {});
+    try {
+      const { summary } = await runEvaluatorReview({ trigger: "telegram" });
+      await sendMessage(summary).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Evaluator failed: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/compress" || text.startsWith("/compress ")) {
+    setActiveSender("COMPRESSOR");
+    const roleArg = text.slice("/compress".length).trim().toUpperCase();
+    await sendMessage("🗜️ [COMPRESSOR] Compressing agent memory (backing up first)…").catch(() => {});
+    try {
+      const results = roleArg
+        ? [await compressAgentMemory(roleArg, { force: true })]
+        : await compressIfNeeded();
+      const acted = results.filter((r) => r && !r.skipped);
+      const msg = acted.length
+        ? acted.map((r) => `🗜️ [COMPRESSOR] ${r.role}: ${r.removed}→${r.added} lessons (backup: ${r.backup ? r.backup.split("/").pop() : "?"})`).join("\n")
+        : "🗜️ [COMPRESSOR] Nothing to compress — no role over threshold.";
+      await sendMessage(msg).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Compressor failed: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
   if (text === "/positions") {
     try {
       const { positions, total_positions } = await getMyPositions({ force: true });
@@ -1911,6 +2155,47 @@ Commands:
         console.log("\n  No closed positions yet — thresholds are preset defaults.");
       }
       console.log();
+      rl.prompt();
+      return;
+    }
+
+    if (input.startsWith("/diag") || input.startsWith("/health")) {
+      await runBusy(async () => {
+        const { text } = await runConnectivityCheck();
+        console.log("\n" + text + "\n");
+      });
+      rl.prompt();
+      return;
+    }
+
+    if (input.startsWith("/evaluator")) {
+      await runBusy(async () => {
+        const arg = input.slice("/evaluator".length).trim();
+        if (arg.startsWith("apply")) {
+          const id = arg.slice("apply".length).trim() || null;
+          const res = applyEvaluatorProposal(id);
+          console.log(`\n${res.ok ? "✅" : "⚠️"} ${res.message}\n`);
+          return;
+        }
+        console.log("\nRunning evaluator review…\n");
+        const { summary } = await runEvaluatorReview({ trigger: "repl" });
+        console.log(`\n${summary}\n`);
+      });
+      rl.prompt();
+      return;
+    }
+
+    if (input.startsWith("/compress")) {
+      await runBusy(async () => {
+        const roleArg = input.slice("/compress".length).trim().toUpperCase();
+        console.log("\nCompressing agent memory (backing up first)…\n");
+        const results = roleArg ? [await compressAgentMemory(roleArg, { force: true })] : await compressIfNeeded();
+        const acted = results.filter((r) => r && !r.skipped);
+        console.log(acted.length
+          ? acted.map((r) => `  ${r.role}: ${r.removed}→${r.added} lessons (backup: ${r.backup ? r.backup.split("/").pop() : "?"})`).join("\n")
+          : "  Nothing to compress — no role over threshold.");
+        console.log();
+      });
       rl.prompt();
       return;
     }

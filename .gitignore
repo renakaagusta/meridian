@@ -18,6 +18,9 @@ pool-memory.json
 token-blacklist.json
 strategy-library.json
 decision-log.json
+decision-traces.jsonl
+evaluator-proposals.jsonl
+hivemind-outbound.jsonl
 hivemind-cache.json
 signal-weights.json
 
@@ -41,3 +44,10 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# fabriq benchmark auth token (do not commit)
+.fabriq-token
+benchmark/
+
+# memory compression backups
+memory-backups/

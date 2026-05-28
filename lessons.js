@@ -31,6 +31,52 @@ const PERFORMANCE_SIGNAL_FIELDS = [
   "volatility",
 ];
 const MAX_MANUAL_LESSON_LENGTH = 400;
+const LESSON_MAX_AGE_DAYS = 30;        // performance lessons older than this decay out
+const MAX_PERFORMANCE_LESSONS = 60;    // hard cap on stored auto-derived lessons
+
+/**
+ * Decay + dedup performance-derived lessons so lessons.json stays small and
+ * non-contradictory. Pinned / manual / evolution lessons are never touched.
+ * Same-feature, same-polarity lessons are merged (samples accumulate, confidence = max).
+ */
+function prunePerformanceLessons(data) {
+  const now = Date.now();
+  const maxAgeMs = LESSON_MAX_AGE_DAYS * 86_400_000;
+  const keep = [];
+  const byKey = new Map();
+
+  for (const l of data.lessons || []) {
+    const isPerf = l.sourceType === "performance" && !l.pinned;
+    if (!isPerf) { keep.push(l); continue; }
+
+    const created = Date.parse(l.created_at || "") || now;
+    if (now - created > maxAgeMs && (l.confidence ?? 0) < 0.8) continue; // decay stale, low-confidence
+
+    const key = `${l.feature_key || String(l.rule).slice(0, 40)}|${l.polarity || l.outcome}`;
+    const existing = byKey.get(key);
+    if (!existing) { byKey.set(key, { ...l, samples: l.samples || 1 }); continue; }
+
+    const newer = (l.created_at || "") >= (existing.created_at || "") ? l : existing;
+    byKey.set(key, {
+      ...newer,
+      samples: (existing.samples || 1) + (l.samples || 1),
+      confidence: Math.max(existing.confidence ?? 0, l.confidence ?? 0),
+      created_at: (existing.created_at || "") >= (l.created_at || "") ? existing.created_at : l.created_at,
+    });
+  }
+
+  let next = [...keep, ...byKey.values()];
+
+  const perf = next
+    .filter((l) => l.sourceType === "performance" && !l.pinned)
+    .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
+  if (perf.length > MAX_PERFORMANCE_LESSONS) {
+    const drop = new Set(perf.slice(MAX_PERFORMANCE_LESSONS).map((l) => l.id));
+    next = next.filter((l) => !drop.has(l.id));
+  }
+
+  data.lessons = next;
+}
 
 function sanitizeLessonText(text, maxLen = MAX_MANUAL_LESSON_LENGTH) {
   if (text == null) return null;
@@ -151,6 +197,7 @@ export async function recordPerformance(perf) {
     log("lessons", `New lesson: ${lesson.rule}`);
   }
 
+  prunePerformanceLessons(data);
   save(data);
   if (lesson) {
     void pushHiveLesson(lesson);
@@ -224,35 +271,32 @@ function derivLesson(perf) {
 
   if (outcome === "neutral") return null; // nothing interesting to learn
 
-  // Build context description
-  const context = [
-    `${perf.pool_name}`,
-    `strategy=${perf.strategy}`,
-    `bin_step=${perf.bin_step}`,
-    `volatility=${perf.volatility}`,
-    `fee_tvl_ratio=${perf.fee_tvl_ratio}`,
-    `organic=${perf.organic_score}`,
-    `bin_range=${typeof perf.bin_range === 'object' ? JSON.stringify(perf.bin_range) : perf.bin_range}`,
-  ].join(", ");
+  // Transferable feature descriptor — leads the rule so lessons generalize across
+  // tokens instead of being keyed on a one-off pool name (which never recurs).
+  const volBand = volatilityBand(perf.volatility);
+  const feeBand = feeTvlBand(perf.fee_tvl_ratio);
+  const featureKey = `${perf.strategy || "?"}|${volBand.key}|bs${perf.bin_step ?? "?"}`;
+  const features = `strategy="${perf.strategy}" @ ${volBand.label}(${fmtNum(perf.volatility)}) bin_step=${perf.bin_step}${feeBand ? ` fee_tvl=${feeBand}` : ""}`;
+  const example = perf.pool_name ? ` (e.g. ${perf.pool_name})` : "";
 
   let rule = "";
 
   if (outcome === "good" || outcome === "bad") {
     if (perf.range_efficiency < 30 && outcome === "bad") {
-      rule = `AVOID: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — went OOR ${100 - perf.range_efficiency}% of the time. Consider wider bin_range or bid_ask strategy.`;
-      tags.push("oor", perf.strategy, `volatility_${Math.round(perf.volatility)}`);
+      rule = `AVOID: ${features} — only ${perf.range_efficiency}% in-range${example}. Widen bin_range or use bid_ask for this volatility band.`;
+      tags.push("oor", perf.strategy, volBand.key);
     } else if (perf.range_efficiency > 80 && outcome === "good") {
-      rule = `PREFER: ${perf.pool_name}-type pools (volatility=${perf.volatility}, bin_step=${perf.bin_step}) with strategy="${perf.strategy}" — ${perf.range_efficiency}% in-range efficiency, PnL +${perf.pnl_pct}%.`;
-      tags.push("efficient", perf.strategy);
+      rule = `PREFER: ${features} — ${perf.range_efficiency}% in-range, PnL +${perf.pnl_pct}%${example}.`;
+      tags.push("efficient", perf.strategy, volBand.key);
     } else if (outcome === "bad" && perf.close_reason?.includes("volume")) {
-      rule = `AVOID: Pools with fee_tvl_ratio=${perf.fee_tvl_ratio} that showed volume collapse — fees evaporated quickly. Minimum sustained volume check needed before deploying.`;
-      tags.push("volume_collapse");
+      rule = `AVOID: ${features} with fee_tvl=${perf.fee_tvl_ratio} — volume collapsed, fees evaporated${example}. Require sustained volume before deploying.`;
+      tags.push("volume_collapse", volBand.key);
     } else if (outcome === "good") {
-      rule = `WORKED: ${context} → PnL +${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%.`;
-      tags.push("worked");
+      rule = `WORKED: ${features} → PnL +${perf.pnl_pct}%, in-range ${perf.range_efficiency}%${example}.`;
+      tags.push("worked", perf.strategy, volBand.key);
     } else {
-      rule = `FAILED: ${context} → PnL ${perf.pnl_pct}%, range efficiency ${perf.range_efficiency}%. Reason: ${perf.close_reason}.`;
-      tags.push("failed");
+      rule = `FAILED: ${features} → PnL ${perf.pnl_pct}%, in-range ${perf.range_efficiency}%. Reason: ${perf.close_reason}${example}.`;
+      tags.push("failed", perf.strategy, volBand.key);
     }
   }
 
@@ -280,6 +324,8 @@ function derivLesson(perf) {
     confidence = negativeEvidence ? 0.68 : 0.32;
   }
 
+  const polarity = (outcome === "good") ? "pos" : "neg";
+
   return {
     id: Date.now(),
     rule,
@@ -287,7 +333,10 @@ function derivLesson(perf) {
     outcome,
     sourceType: "performance",
     confidence: Math.round(confidence * 100) / 100,
-    context,
+    context: features,
+    feature_key: featureKey,
+    polarity,
+    samples: 1,
     pnl_pct: perf.pnl_pct,
     fees_earned_usd: perf.fees_earned_usd,
     initial_value_usd: perf.initial_value_usd,
@@ -296,6 +345,29 @@ function derivLesson(perf) {
     pool: perf.pool,
     created_at: new Date().toISOString(),
   };
+}
+
+// ─── Lesson feature banding (for transferable, dedup-able lessons) ──
+function volatilityBand(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return { key: "vol_unknown", label: "unknown-vol" };
+  if (n < 2)  return { key: "vol_low",  label: "low-vol" };
+  if (n < 5)  return { key: "vol_mid",  label: "mid-vol" };
+  return { key: "vol_high", label: "high-vol" };
+}
+
+function feeTvlBand(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n < 0.1) return "very-low";
+  if (n < 0.5) return "low";
+  if (n < 2)   return "mid";
+  return "high";
+}
+
+function fmtNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? (Math.round(n * 10) / 10) : "?";
 }
 
 // ─── Adaptive Threshold Evolution ──────────────────────────────
@@ -324,12 +396,18 @@ export function evolveThresholds(perfData, config) {
   // ── 1. maxVolatility ─────────────────────────────────────────
   // If losers tend to cluster at higher volatility → tighten the ceiling.
   // If winners span higher volatility safely → we can loosen a bit.
+  // maxVolatility is opt-in: only tune it once a finite ceiling exists (or seed one from loser data).
   {
     const winnerVols = winners.map((p) => p.volatility).filter(isFiniteNum);
     const loserVols  = losers.map((p) => p.volatility).filter(isFiniteNum);
-    const current    = config.screening.maxVolatility;
+    // Seed a ceiling from loser data when none is set yet, so the tuner can engage.
+    const current    = isFiniteNum(config.screening.maxVolatility)
+      ? config.screening.maxVolatility
+      : (loserVols.length >= 2 ? 20.0 : null);
 
-    if (loserVols.length >= 2) {
+    if (current == null) {
+      // No ceiling and not enough loser signal to seed one — skip this block entirely.
+    } else if (loserVols.length >= 2) {
       // 25th percentile of loser volatilities — this is where things start going wrong
       const loserP25 = percentile(loserVols, 25);
       if (loserP25 < current) {
@@ -357,12 +435,12 @@ export function evolveThresholds(perfData, config) {
     }
   }
 
-  // ── 2. minFeeTvlRatio ─────────────────────────────────────────
+  // ── 2. minFeeActiveTvlRatio ───────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
-    const current    = config.screening.minFeeTvlRatio;
+    const current    = config.screening.minFeeActiveTvlRatio;
 
     if (winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
@@ -372,8 +450,8 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
         const rounded = Number(newVal.toFixed(2));
         if (rounded > current) {
-          changes.minFeeTvlRatio = rounded;
-          rationale.minFeeTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
+          changes.minFeeActiveTvlRatio = rounded;
+          rationale.minFeeActiveTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
         }
       }
     }
@@ -388,9 +466,9 @@ export function evolveThresholds(perfData, config) {
           const target  = maxLoserFee * 1.2;
           const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
           const rounded = Number(newVal.toFixed(2));
-          if (rounded > current && !changes.minFeeTvlRatio) {
-            changes.minFeeTvlRatio = rounded;
-            rationale.minFeeTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
+          if (rounded > current && !changes.minFeeActiveTvlRatio) {
+            changes.minFeeActiveTvlRatio = rounded;
+            rationale.minFeeActiveTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
           }
         }
       }
@@ -437,9 +515,9 @@ export function evolveThresholds(perfData, config) {
 
   // Apply to live config object immediately
   const s = config.screening;
-  if (changes.maxVolatility    != null) s.maxVolatility    = changes.maxVolatility;
-  if (changes.minFeeTvlRatio   != null) s.minFeeTvlRatio   = changes.minFeeTvlRatio;
-  if (changes.minOrganic       != null) s.minOrganic       = changes.minOrganic;
+  if (changes.maxVolatility        != null) s.maxVolatility        = changes.maxVolatility;
+  if (changes.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = changes.minFeeActiveTvlRatio;
+  if (changes.minOrganic           != null) s.minOrganic           = changes.minOrganic;
 
   // Log a lesson summarizing the evolution
   const data = load();
@@ -578,6 +656,43 @@ export function removeLessonsByKeyword(keyword) {
   return before - data.lessons.length;
 }
 
+const _ROLE_TAG = { SCREENER: "screening", MANAGER: "management", CHALLENGER: "risk" };
+
+/** Lessons eligible for compression for a role: that role's own, not pinned, not auto-evolution. */
+export function compressibleLessons(role) {
+  return load().lessons.filter((l) =>
+    l.role === role && !l.pinned &&
+    l.sourceType !== "evolution" && !(l.tags || []).includes("evolution"));
+}
+
+/**
+ * Replace a role's compressible lessons with a consolidated (compressed) set.
+ * Pinned lessons, evolution lessons, and other roles' lessons are never touched.
+ * Used by the compressor agent.
+ */
+export function replaceAgentLessons(role, compressed) {
+  const data = load();
+  const isCompressible = (l) => l.role === role && !l.pinned &&
+    l.sourceType !== "evolution" && !(l.tags || []).includes("evolution");
+  const removed = data.lessons.filter(isCompressible).length;
+  const kept = data.lessons.filter((l) => !isCompressible(l));
+  const added = (compressed || [])
+    .map((c) => ({
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      rule: sanitizeLessonText(c.rule),
+      tags: [...new Set([...(Array.isArray(c.tags) ? c.tags : []), "compressed", _ROLE_TAG[role]])].filter(Boolean),
+      outcome: "manual",
+      sourceType: "compressed",
+      role,
+      created_at: new Date().toISOString(),
+    }))
+    .filter((l) => l.rule);
+  data.lessons = [...kept, ...added];
+  save(data);
+  log("lessons", `Compressed ${role}: ${removed} → ${added.length} lessons`);
+  return { role, removed, added: added.length };
+}
+
 /**
  * Clear ALL lessons (keeps performance data).
  */
@@ -606,6 +721,7 @@ export function clearPerformance() {
 const ROLE_TAGS = {
   SCREENER: ["screening", "narrative", "strategy", "deployment", "token", "volume", "entry", "bundler", "holders", "organic"],
   MANAGER:  ["management", "risk", "oor", "fees", "position", "hold", "close", "pnl", "rebalance", "claim"],
+  CHALLENGER: ["risk", "oor", "failed", "volume_collapse", "bundler", "wash", "rug", "drawdown", "challenger", "holders", "loss"],
   GENERAL:  [], // all lessons
 };
 

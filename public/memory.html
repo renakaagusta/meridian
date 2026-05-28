@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Meridian — Agent Memory</title>
+<style>
+  :root{ --bg:#0b0e14; --panel:#11151f; --line:#1e2433; --text:#dbe2f0; --muted:#8a93a6; --accent:#6ee7b7; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
+  header{position:sticky;top:0;z-index:5;background:#0b0e14ee;backdrop-filter:blur(6px);border-bottom:1px solid var(--line);padding:14px 20px}
+  h1{margin:0 0 2px;font-size:16px;letter-spacing:.5px}
+  .sub{color:var(--muted);font-size:12px}
+  nav{margin-top:8px;display:flex;gap:14px;font-size:13px}
+  nav a{color:var(--muted);text-decoration:none}
+  nav a.on{color:var(--accent)}
+  main{max-width:1000px;margin:0 auto;padding:20px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:780px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;border-left:3px solid var(--c,#456)}
+  .card h2{margin:0 0 4px;font-size:14px}
+  .reads{color:var(--muted);font-size:11px;margin-bottom:10px}
+  pre{margin:0;white-space:pre-wrap;word-break:break-word;font-size:12px;color:#c2cadb;background:#0b0e14;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:340px;overflow:auto}
+  .empty{color:var(--muted);font-style:italic}
+  section.store{margin-top:24px}
+  h2.s{font-size:14px;border-bottom:1px solid var(--line);padding-bottom:6px}
+  table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600}
+  .tag{display:inline-block;background:#1e2433;border-radius:4px;padding:0 5px;margin:0 2px 2px 0;font-size:10px}
+  .role{font-weight:700;font-size:10px;padding:1px 6px;border-radius:4px}
+  .role.SCREENER{background:#6ee7b733;color:#6ee7b7}.role.MANAGER{background:#f0b35b33;color:#f0b35b}
+  .role.CHALLENGER{background:#ff7a9333;color:#ff7a93}.role.GENERAL,.role.null{background:#4b546833;color:#8a93a6}
+  .o-good{color:#6ee7b7}.o-bad{color:#ff7a93}.o-manual{color:#7aa2f7}
+  footer{color:var(--muted);text-align:center;padding:22px;font-size:11px}
+</style>
+</head>
+<body>
+<header>
+  <h1>◎ MERIDIAN — Agent Memory</h1>
+  <div class="sub" id="sub">loading…</div>
+  <nav><a href="/">Timeline</a><a href="/memory" class="on">Memory</a></nav>
+</header>
+<main>
+  <div class="grid" id="agents"></div>
+
+  <section class="store">
+    <h2 class="s">🗃️ Lesson store (all stored lessons)</h2>
+    <table id="lessons"><thead><tr><th>role</th><th>outcome</th><th>rule</th><th>tags</th><th>×</th><th>conf</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="store">
+    <h2 class="s">📈 Performance & 🧭 Evaluator proposals</h2>
+    <div class="grid">
+      <div class="card" style="--c:#bb9af7"><h2>Closed-position performance</h2><pre id="perf"></pre></div>
+      <div class="card" style="--c:#e06c9f"><h2>Latest evaluator proposals</h2><pre id="proposals"></pre></div>
+    </div>
+  </section>
+
+  <section class="store">
+    <h2 class="s">🏊 Pool memory</h2>
+    <pre id="poolmem"></pre>
+  </section>
+</main>
+<footer>auto-refreshes every 20s · shows exactly what each agent reads from memory</footer>
+
+<script>
+const COLOR = { SCREENER:"#6ee7b7", MANAGER:"#f0b35b", CHALLENGER:"#ff7a93", EVALUATOR:"#e06c9f" };
+function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+function renderAgents(agents){
+  const el = document.getElementById("agents"); el.innerHTML="";
+  for(const [name, a] of Object.entries(agents)){
+    const div = document.createElement("div");
+    div.className="card"; div.style.setProperty("--c", COLOR[name]||"#456");
+    let body = "";
+    if(a.injected_lessons!=null) body += `<b>Injected lessons:</b>\n${esc(a.injected_lessons) || "(none yet)"}\n`;
+    if(a.recent_decisions!=null) body += `\n<b>Recent decisions:</b>\n${esc(a.recent_decisions)}\n`;
+    if(a.performance!=null) body += `\n<b>Performance:</b>\n${esc(JSON.stringify(a.performance,null,1))}\n`;
+    div.innerHTML = `<h2 style="color:${COLOR[name]||'#fff'}">${name}</h2>`+
+      `<div class="reads">reads: ${esc(a.reads||"")}</div>`+
+      `<pre>${body.trim() || '<span class="empty">no memory injected yet</span>'}</pre>`;
+    el.appendChild(div);
+  }
+}
+
+function renderLessons(lessons){
+  const tb = document.querySelector("#lessons tbody"); tb.innerHTML="";
+  if(!lessons.length){ tb.innerHTML='<tr><td colspan="6" class="empty">no lessons stored yet</td></tr>'; return; }
+  for(const l of lessons){
+    const role = l.role || "GENERAL";
+    const oc = (l.outcome||"").toLowerCase();
+    const ocClass = /good|worked|efficient/.test(oc)?"o-good":/bad|failed|poor/.test(oc)?"o-bad":"o-manual";
+    tb.innerHTML += `<tr>`+
+      `<td><span class="role ${role}">${role}</span></td>`+
+      `<td class="${ocClass}">${esc(l.outcome||"")}</td>`+
+      `<td>${esc(l.rule||"")}</td>`+
+      `<td>${(l.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join("")}</td>`+
+      `<td>${l.samples||1}</td>`+
+      `<td>${l.confidence??""}</td></tr>`;
+  }
+}
+
+async function load(){
+  try{
+    const d = await (await fetch("/api/memory")).json();
+    renderAgents(d.agents||{});
+    renderLessons(d.store?.lessons||[]);
+    document.getElementById("perf").textContent = JSON.stringify(d.store?.performance||{}, null, 1);
+    const props = (d.store?.proposals||[]).map(p=>`${(p.ts||"").slice(5,16)} ${p.id||""}\n  ${(p.assessment||"").slice(0,160)}\n  lessons: ${(p.agent_lessons_written||[]).map(x=>x.agent).join(", ")||"none"}`).join("\n\n");
+    document.getElementById("proposals").textContent = props || "(none yet)";
+    const pools = d.store?.pool_memory?.pools || {};
+    const pm = Object.entries(pools).map(([addr,p])=>`${(p.pool_name||addr.slice(0,8))}: deploys ${p.total_deploys??p.deploys?.length??0} | avgPnl ${p.avg_pnl_pct??"?"}% | winRate ${p.win_rate??"?"} ${p.cooldown_until?"| ⏸cooldown":""}`).join("\n");
+    document.getElementById("poolmem").textContent = pm || "(no pool memory yet)";
+    document.getElementById("sub").textContent = `${(d.store?.lessons||[]).length} lessons · updated ${(d.generated_at||"").slice(11,19)}`;
+  }catch(e){ document.getElementById("sub").textContent = "error: "+e.message; }
+}
+load(); setInterval(load, 20000);
+</script>
+</body>
+</html>

@@ -9,6 +9,12 @@
   },
   "scripts": {
     "setup": "node setup.js",
+    "gen-wallet": "node scripts/gen-wallet.js",
+    "viz": "node server.js",
+    "diag": "node diagnostics.js",
+    "bench:fabriq": "node scripts/fabriq-bench.js",
+    "bench:compare": "node scripts/bench-compare.js",
+    "bench:top": "node scripts/top-performers.js",
     "env:encrypt": "node scripts/envrypt.js encrypt",
     "start": "node index.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
@@ -19,7 +25,11 @@
     "test:syntax": "find . -path ./node_modules -prune -o -name '*.js' -exec node --check {} \\;",
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
-    "postinstall": "node scripts/patch-anchor.js"
+    "postinstall": "node scripts/patch-anchor.js",
+    "bench:vet": "node scripts/vet-performers.js",
+    "bench:explore": "node scripts/explore-trades.js",
+    "bench:eval": "node scripts/periodic-eval.js",
+    "bench:counterfactual": "node scripts/counterfactual-check.js"
   },
   "knip": {
     "ignore": [

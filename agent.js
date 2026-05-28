@@ -4,7 +4,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
+const MANAGER_TOOLS  = new Set(["close_position", "recenter_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
@@ -100,6 +100,22 @@ const client = new OpenAI({
 });
 
 const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
+
+// Surface the real network/HTTP cause behind opaque "fetch failed" / SDK errors.
+export function describeLlmError(error) {
+  const parts = [];
+  if (error?.status) parts.push(`status=${error.status}`);
+  const code = error?.cause?.code || error?.code;
+  if (code) parts.push(`code=${code}`);
+  const errno = error?.cause?.errno;
+  if (errno) parts.push(`errno=${errno}`);
+  const addr = error?.cause?.address;
+  if (addr) parts.push(`addr=${addr}${error?.cause?.port ? ":" + error.cause.port : ""}`);
+  const msg = error?.message || String(error);
+  parts.push(`msg=${msg}`);
+  return parts.join(" ");
+}
 
 const MUTATING_TOOL_INTENTS = /\b(deploy|open position|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|add smart wallet|remove smart wallet|add wallet|remove wallet|pin|unpin|clear lesson|add lesson|set active strategy|remove strategy|add strategy|set |change |update |self.?update|pull latest|git pull|update yourself)\b/i;
 const LIVE_DATA_TOOL_INTENTS = /\b(balance|wallet|position|portfolio|pnl|yield|range|show positions|open positions|screen|candidate|find pool|search|research|analyze|check pool|token holders|narrative|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|list smart wallets|list blacklist|list blocked deployers|list lessons)\b/i;
@@ -172,13 +188,14 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
   // Track write tools fired this session — prevent the model from calling the same
   // destructive tool twice (e.g. deploy twice, swap twice after auto-swap)
-  const ONCE_PER_SESSION = new Set(["deploy_position", "swap_token", "close_position"]);
+  const ONCE_PER_SESSION = new Set(["deploy_position", "swap_token", "close_position", "recenter_position"]);
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, interactive);
   let sawToolCall = false;
   let noToolRetryCount = 0;
+  const transcript = []; // full run capture for decision traces
 
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
@@ -196,7 +213,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
+        const _llmStart = Date.now();
         try {
+          log("llm", `→ ${usedModel} @ ${LLM_BASE_URL} (agent=${agentType}, step=${step}, attempt=${attempt + 1}, tools=${getToolsForRole(agentType, goal).length}, tool_choice=${toolChoice})`);
           response = await client.chat.completions.create({
             model: usedModel,
             messages,
@@ -205,7 +224,9 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           });
+          log("llm", `← ${usedModel} ok in ${Date.now() - _llmStart}ms (finish=${response.choices?.[0]?.finish_reason ?? "?"}, usage=${JSON.stringify(response.usage ?? {})})`);
         } catch (error) {
+          log("llm_error", `✗ ${usedModel} @ ${LLM_BASE_URL} failed in ${Date.now() - _llmStart}ms — ${describeLlmError(error)}`);
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
             messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
@@ -264,6 +285,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
       }
       messages.push(msg);
+      transcript.push({
+        step,
+        role: "assistant",
+        content: msg.content ?? null,
+        tool_calls: (msg.tool_calls || []).map((tc) => ({
+          id: tc.id,
+          name: tc.function?.name,
+          arguments: tc.function?.arguments,
+        })),
+      });
 
       // If the model didn't call any tools, it's done
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
@@ -281,6 +312,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             return {
               content: "I couldn't complete that reliably because no tool call was made. Please retry after checking the logs.",
               userMessage: goal,
+              transcript,
             };
           }
           messages.push({
@@ -293,7 +325,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         }
         log("agent", "Final answer reached");
         log("agent", msg.content);
-        return { content: msg.content, userMessage: goal };
+        return { content: msg.content, userMessage: goal, transcript };
       }
       sawToolCall = true;
 
@@ -357,6 +389,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
         await onToolStart?.({ name: functionName, args: functionArgs, step });
         const result = await executeTool(functionName, functionArgs);
+        transcript.push({ step, role: "tool", tool_call_id: toolCall.id, name: functionName, args: functionArgs, result });
         await onToolFinish?.({
           name: functionName,
           args: functionArgs,
@@ -365,10 +398,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           step,
         });
 
-        // Lock deploy_position after first attempt regardless of outcome — retrying is never right
-        // For close/swap: only lock on success so genuine failures can be retried
-        if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
-        else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+        // Lock deploy_position after a real attempt — but NOT when it was blocked
+        // pre-execution (safety check / challenger veto): nothing moved on-chain, so the
+        // screener must stay free to try a different candidate this cycle.
+        // For close/swap: only lock on success so genuine failures can be retried.
+        const wasPreBlocked = result?.blocked === true;
+        if (!wasPreBlocked) {
+          if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
+          else if (ONCE_PER_SESSION.has(functionName) && result.success === true) firedOnce.add(functionName);
+        }
 
         return {
           role: "tool",
@@ -394,7 +432,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   }
 
   log("agent", "Max steps reached without final answer");
-  return { content: "Max steps reached. Review logs for partial progress.", userMessage: goal };
+  return { content: "Max steps reached. Review logs for partial progress.", userMessage: goal, transcript };
 }
 
 function sleep(ms) {
