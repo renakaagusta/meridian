@@ -254,6 +254,10 @@ const { values: flags } = parseArgs({
     "silent":     { type: "boolean" },
     limit:        { type: "string" },
     text:         { type: "string" },
+    role:         { type: "string" },
+    id:           { type: "string" },
+    trigger:      { type: "string" },
+    force:        { type: "boolean" },
   },
   allowPositionals: true,
   strict: false,
@@ -690,6 +694,46 @@ switch (subcommand) {
     if (!poolAddress) die("Usage: meridian smart-wallets --pool <pool_address>");
     const { checkSmartWalletsOnPool } = await import("./smart-wallets.js");
     out(await checkSmartWalletsOnPool({ pool_address: poolAddress }));
+    break;
+  }
+
+  // ── recenter --position <addr> [--bins-below N] [--strategy spot|curve|bid_ask] [--reason "..."] ──
+  case "recenter": {
+    const positionAddress = flags.position;
+    if (!positionAddress) die("Usage: meridian recenter --position <addr> [--bins-below N] [--strategy spot|curve|bid_ask] [--reason \"...\"]");
+    const { recenterPosition } = await import("./tools/dlmm.js");
+    out(await recenterPosition({
+      position_address: positionAddress,
+      bins_below: flags["bins-below"] ? parseInt(flags["bins-below"]) : undefined,
+      strategy: flags.strategy,
+      reason: flags.reason,
+    }));
+    break;
+  }
+
+  // ── evaluator [--trigger <label>] — run a propose-only meta-review ──
+  case "evaluator": {
+    const { runEvaluatorReview } = await import("./evaluator.js");
+    out(await runEvaluatorReview({ trigger: flags.trigger || "cli" }));
+    break;
+  }
+
+  // ── evaluator-apply [--id <proposal_id>] — apply a proposal (default: latest) ──
+  case "evaluator-apply": {
+    const { applyEvaluatorProposal } = await import("./evaluator.js");
+    out(applyEvaluatorProposal(flags.id || null));
+    break;
+  }
+
+  // ── compressor [--role <SCREENER|MANAGER|CHALLENGER>] [--force] ──
+  case "compressor": {
+    if (flags.role) {
+      const { compressAgentMemory } = await import("./compressor.js");
+      out(await compressAgentMemory(flags.role, { force: !!flags.force }));
+    } else {
+      const { compressIfNeeded } = await import("./compressor.js");
+      out(await compressIfNeeded());
+    }
     break;
   }
 
