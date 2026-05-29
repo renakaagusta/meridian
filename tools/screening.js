@@ -375,14 +375,43 @@ async function refreshDiscordOnlyPools(pools, timeframe) {
   }
 }
 
+// ─── Discovery cache (5 min TTL) ─────────────────────────────────
+// The Meteora discovery API + per-pool enrichment is the slowest leg
+// of the screening cycle (p50 ~4s, p95 ~9.5s). Within a 5-minute window
+// the candidate set barely moves; keyed by (page_size, timeframe, category)
+// so callers with different params still get fresh data.
+const DISCOVERY_CACHE_TTL = 5 * 60_000;
+const _discoveryCache = new Map();
+
+function _discoveryKey({ page_size, timeframe, category }) {
+  return `${page_size}|${timeframe || ""}|${category || ""}`;
+}
+
+export function invalidateDiscoveryCache() {
+  _discoveryCache.clear();
+}
+
 /**
  * Fetch pools from the Meteora Pool Discovery API.
  * Returns condensed data optimized for LLM consumption (saves tokens).
+ *
+ * Results are cached for 5 minutes per (page_size, timeframe, category)
+ * triple. Pass { bypassCache: true } to force a fresh fetch.
  */
 export async function discoverPools({
   page_size = 50,
+  bypassCache = false,
 } = {}) {
   const s = config.screening;
+
+  const cacheKey = _discoveryKey({ page_size, timeframe: s.timeframe, category: s.category });
+  if (!bypassCache) {
+    const cached = _discoveryCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < DISCOVERY_CACHE_TTL) {
+      return cached.result;
+    }
+  }
+
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -530,11 +559,13 @@ export async function discoverPools({
     }
   }
 
-  return {
+  const result = {
     total: data.total,
     pools,
     filtered_examples: filteredExamples,
   };
+  _discoveryCache.set(cacheKey, { at: Date.now(), result });
+  return result;
 }
 
 /**
