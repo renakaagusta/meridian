@@ -258,6 +258,7 @@ const { values: flags } = parseArgs({
     id:           { type: "string" },
     trigger:      { type: "string" },
     force:        { type: "boolean" },
+    "max-owners": { type: "string" },
   },
   allowPositionals: true,
   strict: false,
@@ -734,6 +735,43 @@ switch (subcommand) {
       const { compressIfNeeded } = await import("./compressor.js");
       out(await compressIfNeeded());
     }
+    break;
+  }
+
+  // ── dex --pool <addr> — DexScreener velocity for a Solana pool ───
+  case "dex": {
+    const pool = flags.pool;
+    if (!pool) die("Usage: meridian dex --pool <pool_address>");
+    const { getDexscreenerPair } = await import("./tools/external-signals.js");
+    out(await getDexscreenerPair({ pool_address: pool }));
+    break;
+  }
+
+  // ── rugcheck --mint <addr> — RugCheck report for a token mint ────
+  case "rugcheck": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian rugcheck --mint <token_mint>");
+    const { getRugcheckReport } = await import("./tools/external-signals.js");
+    out(await getRugcheckReport({ mint }));
+    break;
+  }
+
+  // ── pumpfun --mint <addr> — Pump.fun bonding-curve status ────────
+  case "pumpfun": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian pumpfun --mint <token_mint>");
+    const { getPumpfunStatus } = await import("./tools/external-signals.js");
+    out(await getPumpfunStatus({ mint }));
+    break;
+  }
+
+  // ── lp-cohort --pool <addr> — full LP cohort PnL distribution ────
+  case "lp-cohort": {
+    const pool = flags.pool;
+    if (!pool) die("Usage: meridian lp-cohort --pool <pool_address> [--max-owners N]");
+    const { getPoolLpCohort } = await import("./tools/lp-cohort.js");
+    const maxOwners = flags["max-owners"] ? parseInt(flags["max-owners"]) : undefined;
+    out(await getPoolLpCohort({ pool_address: pool, max_owners_sampled: maxOwners }));
     break;
   }
 
