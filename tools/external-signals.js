@@ -50,7 +50,7 @@ export async function getDexscreenerPair({ pool_address }) {
     const isVolumeDying = v6h > 0 && v1h < vBaseline1h * 0.3;
     const isVolumeStalled = v5m === 0 && v1h < 10;
 
-    return {
+    const result = {
       pool: pool_address,
       base_symbol: p.baseToken?.symbol,
       base_mint: p.baseToken?.address,
@@ -83,7 +83,38 @@ export async function getDexscreenerPair({ pool_address }) {
         is_volume_dying: isVolumeDying,
         is_volume_stalled: isVolumeStalled,
       },
+      // DexScreener's short-window fields (esp. 5m) are unreliable for thin
+      // pools — the challenger repeatedly catches them fabricated. Default the
+      // velocity source label to dexscreener; overlay accurate Birdeye 1h/4h/24h
+      // windows below when the token is in Birdeye's trending set.
+      velocity_source: "dexscreener",
     };
+
+    // Overlay accurate Birdeye find-gems velocity (keyless, via scraper) when
+    // available. Non-fatal: any failure leaves the DexScreener result intact.
+    try {
+      const { getBirdeyeVelocity } = await import("./birdeye.js");
+      const be = await getBirdeyeVelocity({ mint: result.base_mint });
+      if (be && be.found) {
+        result.birdeye_velocity = {
+          "1h": be.velocity?.["1h"] ?? null,
+          "4h": be.velocity?.["4h"] ?? null,
+          "24h": be.velocity?.["24h"] ?? null,
+          holder_count: be.holder_count ?? null,
+          top10_holder_pct: be.top10_holder_pct ?? null,
+          stale: !!be.list_stale,
+          age_sec: be.list_age_sec ?? null,
+        };
+        result.velocity_source = "birdeye";
+        result.velocity_note =
+          "Prefer birdeye_velocity (real on-chain windows) over the price_change/volume/txns fields, which are DexScreener short-window estimates and unreliable for thin pools. Birdeye has no 5m window — use 1h as the shortest trustworthy interval.";
+      }
+    } catch (e) {
+      // stderr only — stdout carries the tool's JSON result.
+      console.error(`[birdeye] overlay_error: ${e.message}`);
+    }
+
+    return result;
   } catch (e) {
     log("dexscreener_error", e.message);
     return { error: e.message };

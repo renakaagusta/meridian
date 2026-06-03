@@ -765,6 +765,29 @@ switch (subcommand) {
     break;
   }
 
+  // ── birdeye-gems — keyless Birdeye trending list (accurate velocity) ──
+  case "birdeye-gems": {
+    const { getBirdeyeGems } = await import("./tools/birdeye.js");
+    out(await getBirdeyeGems({
+      chain: flags.chain || "solana",
+      type: flags.type || "trending",
+      sort_by: flags.sort || "tf24h.volumeChangePercent",
+      sort_type: flags["sort-type"] || "desc",
+      limit: flags.limit ? parseInt(flags.limit) : 50,
+      shown_time_frame: flags.tf || "24h",
+    }));
+    break;
+  }
+
+  // ── birdeye-velocity --mint <addr> — accurate 1h/4h/24h velocity ──────
+  case "birdeye-velocity": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-velocity --mint <token_mint>");
+    const { getBirdeyeVelocity } = await import("./tools/birdeye.js");
+    out(await getBirdeyeVelocity({ mint, chain: flags.chain || "solana" }));
+    break;
+  }
+
   // ── lp-cohort --pool <addr> — full LP cohort PnL distribution ────
   case "lp-cohort": {
     const pool = flags.pool;
