@@ -779,12 +779,21 @@ switch (subcommand) {
     break;
   }
 
-  // ── birdeye-velocity --mint <addr> — accurate 1h/4h/24h velocity ──────
+  // ── birdeye-velocity --mint <addr> — accurate 30m/1h/2h/4h/24h velocity ─
   case "birdeye-velocity": {
     const mint = flags.mint;
     if (!mint) die("Usage: meridian birdeye-velocity --mint <token_mint>");
     const { getBirdeyeVelocity } = await import("./tools/birdeye.js");
     out(await getBirdeyeVelocity({ mint, chain: flags.chain || "solana" }));
+    break;
+  }
+
+  // ── birdeye-security --mint <addr> — keyless token security/risk ───────
+  case "birdeye-security": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-security --mint <token_mint>");
+    const { getBirdeyeSecurity } = await import("./tools/birdeye.js");
+    out(await getBirdeyeSecurity({ mint, chain: flags.chain || "solana" }));
     break;
   }
 

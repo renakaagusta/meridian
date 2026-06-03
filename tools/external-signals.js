@@ -90,24 +90,22 @@ export async function getDexscreenerPair({ pool_address }) {
       velocity_source: "dexscreener",
     };
 
-    // Overlay accurate Birdeye find-gems velocity (keyless, via scraper) when
-    // available. Non-fatal: any failure leaves the DexScreener result intact.
+    // Overlay accurate Birdeye velocity (keyless, via scraper) when available.
+    // Uses overview/token: 30m/1h/2h/4h/24h with buy/sell split + unique wallets,
+    // for ANY token. Non-fatal: any failure leaves the DexScreener result intact.
     try {
       const { getBirdeyeVelocity } = await import("./birdeye.js");
       const be = await getBirdeyeVelocity({ mint: result.base_mint });
       if (be && be.found) {
         result.birdeye_velocity = {
-          "1h": be.velocity?.["1h"] ?? null,
-          "4h": be.velocity?.["4h"] ?? null,
-          "24h": be.velocity?.["24h"] ?? null,
+          ...be.velocity,
           holder_count: be.holder_count ?? null,
-          top10_holder_pct: be.top10_holder_pct ?? null,
-          stale: !!be.list_stale,
-          age_sec: be.list_age_sec ?? null,
+          liquidity_usd: be.liquidity_usd ?? null,
+          security_score: be.security_score ?? null,
         };
         result.velocity_source = "birdeye";
         result.velocity_note =
-          "Prefer birdeye_velocity (real on-chain windows) over the price_change/volume/txns fields, which are DexScreener short-window estimates and unreliable for thin pools. Birdeye has no 5m window — use 1h as the shortest trustworthy interval.";
+          "Prefer birdeye_velocity (real on-chain windows w/ buy/sell split + unique wallets) over the price_change/volume/txns fields, which are DexScreener short-window estimates and unreliable for thin pools. Birdeye has no 5m window — 30m is the shortest trustworthy interval.";
       }
     } catch (e) {
       // stderr only — stdout carries the tool's JSON result.

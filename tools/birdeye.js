@@ -1,36 +1,141 @@
 /**
- * tools/birdeye.js — keyless Birdeye "find-gems" velocity + holder signals.
+ * tools/birdeye.js — keyless Birdeye signals via the stackbase scraper.
  *
- * Birdeye's find-gems data (per-window price/volume velocity, unique wallets,
- * holder count, top-10 concentration) is far more reliable than DexScreener's
- * short-window fields, which the challenger repeatedly flags as fabricated for
- * thin memecoin pools. The data has no API key — but it sits behind Cloudflare,
- * so we fetch it through the stackbase scraper's CDP warm-tab (real Chrome over
- * a residential exit). See apps/scraper/src/scrapers/providers/birdeye/gems.ts.
+ * Birdeye's website backend (`birdeye.so/forge/*`) has rich token data with no
+ * API key, but is Cloudflare-gated. We reach it through the stackbase scraper's
+ * generic forge proxy (`POST /scrape/birdeye/forge`), which fetches any /forge/*
+ * path via a real-Chrome residential CDP warm tab and caches results in Redis.
  *
- * Each Meridian CLI command runs as a fresh process, so the gems list is cached
- * to a JSON file on disk with a short TTL. One scraper call (≈50 tokens) serves
- * many per-token velocity lookups within the TTL.
+ * Signals exposed:
+ *   - getBirdeyeVelocity(mint)  → per-token price/volume/wallet velocity at
+ *     30m/1h/2h/4h/24h with buy/sell split (overview/token). 30m is the shortest
+ *     window Birdeye exposes keylessly — there is no 5m.
+ *   - getBirdeyeSecurity(mint)  → mint/freeze authority, renounce, mutable meta,
+ *     creator %, top-10 holder % (token/tokensecurity).
+ *   - getBirdeyeGems(opts)      → trending candidate list (multichain/v3/gems).
  *
- * Windows available: 1h / 4h / 24h (find-gems has no 5m granularity).
+ * Diagnostics go to STDERR only — Meridian CLI writes its JSON result to stdout,
+ * which the agent bridge parses.
  */
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
-
-// Diagnostics MUST go to stderr — Meridian CLI commands write their JSON result
-// to stdout, which agents parse. Any stdout write here would corrupt that.
-const logErr = (tag, msg) => console.error(`[birdeye] ${tag}: ${msg}`);
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const CACHE_FILE = join(__dirname, "..", "birdeye-gems-cache.json");
-
 const SCRAPER_URL = (process.env.MERIDIAN_SCRAPER_URL || "https://scraper.stackbase.id").replace(/\/+$/, "");
 const SCRAPER_SECRET = process.env.MERIDIAN_SCRAPER_SECRET || process.env.SCRAPER_SECRET || "";
-const TTL_SEC = Number(process.env.MERIDIAN_BIRDEYE_TTL_SEC || 120);
-const FETCH_TIMEOUT_MS = Number(process.env.MERIDIAN_BIRDEYE_TIMEOUT_MS || 120000);
+// Bounded so a degraded Birdeye/NUC path can't stall an agent's get_dex_velocity
+// cycle — on timeout the overlay is skipped and DexScreener data is used. A warm
+// tab answers in ~2-5s; a cold warm-up in ~15-25s; both fit under 35s.
+const FETCH_TIMEOUT_MS = Number(process.env.MERIDIAN_BIRDEYE_TIMEOUT_MS || 35000);
 
-const DEFAULTS = {
+const logErr = (tag, msg) => console.error(`[birdeye] ${tag}: ${msg}`);
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout after ${ms}ms`)), ms)),
+  ]);
+}
+
+/**
+ * Fetch any Birdeye forge path through the scraper proxy. Returns the parsed
+ * Birdeye response body (the proxy's `json`), or null on any failure. `ttl`
+ * (seconds) controls the scraper-side Redis cache; omit for the default.
+ */
+async function birdeyeForge(path, { method = "GET", body, ttl } = {}) {
+  if (!SCRAPER_SECRET) return null; // feature not provisioned — quiet no-op
+  try {
+    const res = await withTimeout(
+      fetch(`${SCRAPER_URL}/scrape/birdeye/forge`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${SCRAPER_SECRET}` },
+        body: JSON.stringify({ path, method, body, ttl }),
+      }),
+      FETCH_TIMEOUT_MS,
+    );
+    if (!res.ok) {
+      logErr("forge_http", `${res.status} for ${path}`);
+      return null;
+    }
+    const data = await res.json();
+    return data?.json ?? null;
+  } catch (e) {
+    logErr("forge_error", `${e.message} for ${path}`);
+    return null;
+  }
+}
+
+const VEL_WINDOWS = ["30m", "1h", "2h", "4h", "24h"];
+
+function shapeOverview(d) {
+  if (!d) return null;
+  const velocity = {};
+  for (const w of VEL_WINDOWS) {
+    velocity[w] = {
+      price_change_pct: d[`priceChange${w}Percent`] ?? null,
+      volume_usd: d[`v${w}USD`] ?? null,
+      vbuy_usd: d[`vBuy${w}USD`] ?? null,
+      vsell_usd: d[`vSell${w}USD`] ?? null,
+      buys: d[`buy${w}`] ?? null,
+      sells: d[`sell${w}`] ?? null,
+      trades: d[`trade${w}`] ?? null,
+      unique_wallets: d[`uniqueWallet${w}`] ?? null,
+      unique_wallets_change_pct: d[`uniqueWallet${w}ChangePercent`] ?? null,
+    };
+  }
+  return {
+    symbol: d.symbol ?? null,
+    name: d.name ?? null,
+    price_usd: d.price ?? null,
+    mcap: d.mc ?? null,
+    liquidity_usd: d.liquidity ?? null,
+    holder_count: d.holder ?? null,
+    security_score: d.securityScore ?? null,
+    last_trade_unix: d.lastTradeUnixTime ?? null,
+    velocity,
+  };
+}
+
+/**
+ * Accurate per-token velocity (30m/1h/2h/4h/24h) with buy/sell split + unique
+ * wallets, from Birdeye overview/token. Works for ANY token (not just trending).
+ * Returns `{ found: false }` if the token has no overview (caller keeps its own
+ * source). 30m is the shortest window — Birdeye exposes no 5m keylessly.
+ */
+export async function getBirdeyeVelocity({ mint, chain = "solana" } = {}) {
+  if (!mint) return { found: false, error: "mint is required" };
+  const resp = await birdeyeForge(`/forge/${chain}/overview/token?address=${mint}`);
+  const d = resp?.data;
+  if (!d || !d.address) return { found: false, mint, source: "birdeye-overview" };
+  return { found: true, source: "birdeye-overview", mint, ...shapeOverview(d) };
+}
+
+/**
+ * Token security/risk from Birdeye tokensecurity (GoPlus-style). Returns shaped
+ * authority + concentration flags, or `{ found: false }`.
+ */
+export async function getBirdeyeSecurity({ mint, chain = "solana" } = {}) {
+  if (!mint) return { found: false, error: "mint is required" };
+  const resp = await birdeyeForge(`/forge/${chain}/token/tokensecurity?token=${mint}`);
+  const r = resp?.data?.result?.data;
+  if (!r) return { found: false, mint, source: "birdeye-security" };
+  const pct = (v) => (typeof v === "number" ? +(v * 100).toFixed(2) : null);
+  return {
+    found: true,
+    source: "birdeye-security",
+    mint,
+    creator_address: r.creator_address ?? null,
+    creator_pct: pct(r.creator_percent),
+    owner_pct: pct(r.owner_percent),
+    top10_holder_pct: pct(r.top10_holder_percent),
+    mintable: r.mintable ?? null,
+    mint_renounced: r.renounce ?? null,
+    mutable_metadata: r.mutable_metadata ?? null,
+    freezeable: r.freezeable ?? r.freeze_authority ?? null,
+    non_transferable: r.non_transferable ?? null,
+    transfer_fee_enable: r.transfer_fee_enable ?? null,
+    is_token_2022: r.is_token_2022 ?? null,
+    creation_time_unix: r.creation_time ?? null,
+  };
+}
+
+const GEM_DEFAULTS = {
   chain: "solana",
   type: "trending",
   sort_by: "tf24h.volumeChangePercent",
@@ -40,42 +145,14 @@ const DEFAULTS = {
   shown_time_frame: "24h",
 };
 
-function withTimeout(promise, ms) {
-  return Promise.race([
-    promise,
-    new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout after ${ms}ms`)), ms)),
-  ]);
-}
-
-function readCache() {
-  try {
-    return JSON.parse(readFileSync(CACHE_FILE, "utf8"));
-  } catch {
-    return { entries: {} };
-  }
-}
-
-function writeCache(cache) {
-  try {
-    writeFileSync(CACHE_FILE, JSON.stringify(cache));
-  } catch (e) {
-    logErr("cache_write_error", e.message);
-  }
-}
-
-/** Condense a raw gems item to the fields the screener/challenger care about. */
-function shapeItem(raw) {
-  const win = (tf) => {
-    if (!tf) return null;
-    return {
-      price_change_pct: tf.priceChangePercent ?? null,
-      volume_usd: tf.volumeUSD ?? null,
-      volume_change_pct: tf.volumeChangePercent ?? null,
-      trades: tf.tradeCount ?? null,
-      trades_change_pct: tf.tradeCountChangePercent ?? null,
-      unique_wallets: tf.uniqueWallets ?? null,
-    };
-  };
+function shapeGem(raw) {
+  const win = (tf) => (tf ? {
+    price_change_pct: tf.priceChangePercent ?? null,
+    volume_usd: tf.volumeUSD ?? null,
+    volume_change_pct: tf.volumeChangePercent ?? null,
+    trades: tf.tradeCount ?? null,
+    unique_wallets: tf.uniqueWallets ?? null,
+  } : null);
   const createdMs = raw.createdAt ? Date.parse(raw.createdAt) : null;
   return {
     symbol: raw.symbol ?? null,
@@ -87,113 +164,18 @@ function shapeItem(raw) {
     liquidity_usd: raw.liquidity ?? null,
     holder_count: raw.holderCount ?? null,
     top10_holder_pct: raw.top10HolderPercent != null ? +(raw.top10HolderPercent * 100).toFixed(2) : null,
-    created_at: raw.createdAt ?? null,
     age_hours: createdMs ? Math.round((Date.now() - createdMs) / 36e5) : null,
-    velocity: {
-      "1h": win(raw.tf1h),
-      "4h": win(raw.tf4h),
-      "24h": win(raw.tf24h),
-    },
+    velocity: { "1h": win(raw.tf1h), "4h": win(raw.tf4h), "24h": win(raw.tf24h) },
   };
 }
 
-async function fetchGemsFromScraper(payload) {
-  if (!SCRAPER_SECRET) throw new Error("MERIDIAN_SCRAPER_SECRET (or SCRAPER_SECRET) not set");
-  const res = await withTimeout(
-    fetch(`${SCRAPER_URL}/scrape/birdeye/gems`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${SCRAPER_SECRET}` },
-      body: JSON.stringify(payload),
-    }),
-    FETCH_TIMEOUT_MS,
-  );
-  if (!res.ok) throw new Error(`scraper HTTP ${res.status}`);
-  const data = await res.json();
-  const items = data?.items;
-  if (!Array.isArray(items)) throw new Error("scraper returned no items");
-  return items;
-}
-
-/**
- * Fetch the Birdeye gems list (cached on disk, TTL-bounded). Returns shaped
- * items with per-window velocity + holder data. On a fetch failure, falls back
- * to the last cached copy marked `stale: true`; if no cache exists, returns
- * `{ error, stale: true, items: [] }` so callers can degrade gracefully.
- */
+/** Trending candidate list with per-window velocity + holder data. */
 export async function getBirdeyeGems(opts = {}) {
-  // No secret configured → feature not provisioned. Quietly no-op (no stderr
-  // spam) so callers fall back to their existing source without noise.
-  if (!SCRAPER_SECRET) {
-    return { source: "birdeye-gems", stale: true, error: "not configured", count: 0, items: [] };
+  const payload = { ...GEM_DEFAULTS, ...opts };
+  const resp = await birdeyeForge("/forge/multichain/v3/gems", { method: "POST", body: payload });
+  const items = resp?.data?.items;
+  if (!Array.isArray(items)) {
+    return { source: "birdeye-gems", error: "no data", count: 0, items: [] };
   }
-  const payload = { ...DEFAULTS, ...opts };
-  const key = JSON.stringify(payload);
-  const cache = readCache();
-  const entry = cache.entries?.[key];
-  const now = Date.now();
-
-  if (entry && now - entry.fetched_at < TTL_SEC * 1000) {
-    return {
-      source: "birdeye-gems",
-      fetched_at: new Date(entry.fetched_at).toISOString(),
-      age_sec: Math.round((now - entry.fetched_at) / 1000),
-      stale: false,
-      cached: true,
-      count: entry.items.length,
-      items: entry.items.map(shapeItem),
-    };
-  }
-
-  try {
-    const items = await fetchGemsFromScraper(payload);
-    cache.entries = cache.entries || {};
-    cache.entries[key] = { fetched_at: now, items };
-    writeCache(cache);
-    return {
-      source: "birdeye-gems",
-      fetched_at: new Date(now).toISOString(),
-      age_sec: 0,
-      stale: false,
-      cached: false,
-      count: items.length,
-      items: items.map(shapeItem),
-    };
-  } catch (e) {
-    logErr("gems_error", e.message);
-    if (entry) {
-      return {
-        source: "birdeye-gems",
-        fetched_at: new Date(entry.fetched_at).toISOString(),
-        age_sec: Math.round((now - entry.fetched_at) / 1000),
-        stale: true,
-        cached: true,
-        error: e.message,
-        count: entry.items.length,
-        items: entry.items.map(shapeItem),
-      };
-    }
-    return { source: "birdeye-gems", stale: true, error: e.message, count: 0, items: [] };
-  }
-}
-
-/**
- * Accurate per-token velocity (1h/4h/24h) + holders, looked up from the gems
- * list by mint. Returns `{ found: false }` if the token isn't in Birdeye's
- * trending set (the caller should then keep its existing source). Pull a wide
- * list (limit 100) so the lookup hit-rate is as high as possible.
- */
-export async function getBirdeyeVelocity({ mint, chain = "solana" } = {}) {
-  if (!mint) return { found: false, error: "mint is required" };
-  const gems = await getBirdeyeGems({ chain, limit: 100 });
-  const hit = gems.items.find((i) => i.mint === mint);
-  if (!hit) {
-    return { found: false, mint, source: "birdeye-gems", list_stale: !!gems.stale, list_age_sec: gems.age_sec ?? null };
-  }
-  return {
-    found: true,
-    source: "birdeye-gems",
-    list_stale: !!gems.stale,
-    list_age_sec: gems.age_sec ?? null,
-    ...hit,
-  };
+  return { source: "birdeye-gems", count: items.length, items: items.map(shapeGem) };
 }
