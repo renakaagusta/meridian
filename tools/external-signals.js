@@ -105,7 +105,7 @@ export async function getDexscreenerPair({ pool_address }) {
         };
         result.velocity_source = "birdeye";
         result.velocity_note =
-          "Prefer birdeye_velocity (real on-chain windows w/ buy/sell split + unique wallets) over the price_change/volume/txns fields, which are DexScreener short-window estimates and unreliable for thin pools. Birdeye has no 5m window — 30m is the shortest trustworthy interval.";
+          "Prefer birdeye_velocity (real on-chain windows: true 5m computed from 1m candles, plus 30m/1h/2h/4h/24h with buy/sell split + unique wallets) over the price_change/volume/txns fields, which are DexScreener estimates and unreliable for thin pools.";
       }
     } catch (e) {
       // stderr only — stdout carries the tool's JSON result.

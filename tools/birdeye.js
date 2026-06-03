@@ -61,6 +61,42 @@ async function birdeyeForge(path, { method = "GET", body, ttl } = {}) {
   }
 }
 
+/**
+ * Raw OHLCV candles for a token (or pool) at any resolution Birdeye supports
+ * (1s/5s/1m/5m/15m/1h/...). Returns `{ res, candles: [{t,o,h,l,c,v}] }` newest
+ * last, or null. `v` is base-token volume; multiply by price for ~USD.
+ */
+export async function getBirdeyeOhlcv({ mint, chain = "solana", res = "5m", count = 60 } = {}) {
+  if (!mint) return null;
+  const path = `/forge/${chain}/amm/ohlcv_v2?addr=${mint}&cur=usd&res=${res}&outliers=true&cb=${count}&mc=false&scaled=false`;
+  const resp = await birdeyeForge(path);
+  const d = resp?.data;
+  if (!d || !Array.isArray(d.t)) return null;
+  const candles = d.t.map((t, i) => ({ t, o: d.o?.[i], h: d.h?.[i], l: d.l?.[i], c: d.c?.[i], v: d.v?.[i] }));
+  return { res, count: candles.length, candles };
+}
+
+/**
+ * True trailing 5-minute velocity, computed from 1m candles (Birdeye's overview/
+ * gems only go down to 30m/1h). price_change_pct = last close vs the close ~5
+ * minutes earlier; volume_usd ≈ Σ(base-volume × close) over the last 5 candles.
+ */
+async function compute5m({ mint, chain = "solana" }) {
+  const o = await getBirdeyeOhlcv({ mint, chain, res: "1m", count: 6 });
+  const c = o?.candles?.filter((x) => typeof x.c === "number" && x.c > 0) ?? [];
+  if (c.length < 2) return null;
+  const last = c[c.length - 1];
+  const ref = c[0]; // ~5 candles back
+  const window = c.slice(1); // up to 5 most-recent 1m candles
+  const volUsd = window.reduce((s, x) => s + (typeof x.v === "number" ? x.v * x.c : 0), 0);
+  return {
+    price_change_pct: ref.c ? +(((last.c - ref.c) / ref.c) * 100).toFixed(4) : null,
+    volume_usd: +volUsd.toFixed(2),
+    candles: c.length,
+    to_unix: last.t,
+  };
+}
+
 const VEL_WINDOWS = ["30m", "1h", "2h", "4h", "24h"];
 
 function shapeOverview(d) {
@@ -98,12 +134,18 @@ function shapeOverview(d) {
  * Returns `{ found: false }` if the token has no overview (caller keeps its own
  * source). 30m is the shortest window — Birdeye exposes no 5m keylessly.
  */
-export async function getBirdeyeVelocity({ mint, chain = "solana" } = {}) {
+export async function getBirdeyeVelocity({ mint, chain = "solana", with5m = true } = {}) {
   if (!mint) return { found: false, error: "mint is required" };
-  const resp = await birdeyeForge(`/forge/${chain}/overview/token?address=${mint}`);
+  // overview (30m+) and the computed 5m window run in parallel to bound latency.
+  const [resp, fiveM] = await Promise.all([
+    birdeyeForge(`/forge/${chain}/overview/token?address=${mint}`),
+    with5m ? compute5m({ mint, chain }).catch(() => null) : Promise.resolve(null),
+  ]);
   const d = resp?.data;
   if (!d || !d.address) return { found: false, mint, source: "birdeye-overview" };
-  return { found: true, source: "birdeye-overview", mint, ...shapeOverview(d) };
+  const shaped = shapeOverview(d);
+  if (fiveM) shaped.velocity = { "5m": fiveM, ...shaped.velocity };
+  return { found: true, source: "birdeye-overview", mint, ...shaped };
 }
 
 /**
