@@ -259,6 +259,13 @@ const { values: flags } = parseArgs({
     trigger:      { type: "string" },
     force:        { type: "boolean" },
     "max-owners": { type: "string" },
+    chain:        { type: "string" },
+    res:          { type: "string" },
+    count:        { type: "string" },
+    type:         { type: "string" },
+    sort:         { type: "string" },
+    "sort-type":  { type: "string" },
+    tf:           { type: "string" },
   },
   allowPositionals: true,
   strict: false,
@@ -762,6 +769,52 @@ switch (subcommand) {
     if (!mint) die("Usage: meridian pumpfun --mint <token_mint>");
     const { getPumpfunStatus } = await import("./tools/external-signals.js");
     out(await getPumpfunStatus({ mint }));
+    break;
+  }
+
+  // ── birdeye-gems — keyless Birdeye trending list (accurate velocity) ──
+  case "birdeye-gems": {
+    const { getBirdeyeGems } = await import("./tools/birdeye.js");
+    out(await getBirdeyeGems({
+      chain: flags.chain || "solana",
+      type: flags.type || "trending",
+      sort_by: flags.sort || "tf24h.volumeChangePercent",
+      sort_type: flags["sort-type"] || "desc",
+      limit: flags.limit ? parseInt(flags.limit) : 50,
+      shown_time_frame: flags.tf || "24h",
+    }));
+    break;
+  }
+
+  // ── birdeye-velocity --mint <addr> — accurate 30m/1h/2h/4h/24h velocity ─
+  case "birdeye-velocity": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-velocity --mint <token_mint>");
+    const { getBirdeyeVelocity } = await import("./tools/birdeye.js");
+    out(await getBirdeyeVelocity({ mint, chain: flags.chain || "solana" }));
+    break;
+  }
+
+  // ── birdeye-ohlcv --mint <addr> [--res 5m] [--count 60] — candles ─────
+  case "birdeye-ohlcv": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-ohlcv --mint <token_mint> [--res 5m] [--count 60]");
+    const { getBirdeyeOhlcv } = await import("./tools/birdeye.js");
+    out(await getBirdeyeOhlcv({
+      mint,
+      chain: flags.chain || "solana",
+      res: flags.res || "5m",
+      count: flags.count ? parseInt(flags.count) : 60,
+    }));
+    break;
+  }
+
+  // ── birdeye-security --mint <addr> — keyless token security/risk ───────
+  case "birdeye-security": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-security --mint <token_mint>");
+    const { getBirdeyeSecurity } = await import("./tools/birdeye.js");
+    out(await getBirdeyeSecurity({ mint, chain: flags.chain || "solana" }));
     break;
   }
 
