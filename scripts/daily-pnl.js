@@ -97,6 +97,7 @@ for db in dbs:
             for c in (arr if isinstance(arr,list) else []):
                 if c.get("id") and (c.get("function") or {}).get("name")=="swap_token": cm.add(c["id"])
     for content,tc,tcid,ts in rows:
+        ts=ts.replace(" ","T") if ts else ts
         if tcid in cm and content and ts and ts>RESET_TS:
             try: d=json.loads(content)["data"]
             except Exception: continue
