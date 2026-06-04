@@ -266,6 +266,10 @@ const { values: flags } = parseArgs({
     sort:         { type: "string" },
     "sort-type":  { type: "string" },
     tf:           { type: "string" },
+    "min-change": { type: "string" },
+    "max-change": { type: "string" },
+    "min-tvl":    { type: "string" },
+    "min-volume": { type: "string" },
   },
   allowPositionals: true,
   strict: false,
@@ -782,6 +786,38 @@ switch (subcommand) {
       sort_type: flags["sort-type"] || "desc",
       limit: flags.limit ? parseInt(flags.limit) : 50,
       shown_time_frame: flags.tf || "24h",
+    }));
+    break;
+  }
+
+  // ── agent-health — per-agent health snapshot for Atlas (detection only) ──
+  case "agent-health": {
+    const { getAgentHealth } = await import("./tools/agent-health.js");
+    out(await getAgentHealth());
+    break;
+  }
+
+  // ── notify --text "..." — send a Telegram alert (used by Atlas health sweep) ──
+  case "notify": {
+    const text = flags.text || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "notify");
+    if (!text) die("Usage: meridian notify --text \"<message>\"");
+    const tg = await import("./telegram.js");
+    if (!tg.isEnabled()) { out({ sent: false, reason: "telegram not configured" }); break; }
+    const res = await tg.sendMessage(`🛰️ Atlas alert: ${text}`).catch((e) => ({ error: e.message }));
+    out({ sent: !res?.error, result: res?.error || "ok" });
+    break;
+  }
+
+  // ── momentum-candidates — Hunter's momentum-tuned spot candidate list ──
+  case "momentum-candidates": {
+    const { getMomentumCandidates } = await import("./tools/birdeye.js");
+    out(await getMomentumCandidates({
+      limit: flags.limit ? parseInt(flags.limit) : 5,
+      min_change: flags["min-change"] != null ? parseFloat(flags["min-change"]) : 3,
+      max_change: flags["max-change"] != null ? parseFloat(flags["max-change"]) : 80,
+      min_tvl: flags["min-tvl"] != null ? parseFloat(flags["min-tvl"]) : 20000,
+      min_volume: flags["min-volume"] != null ? parseFloat(flags["min-volume"]) : 0,
+      chain: flags.chain || "solana",
     }));
     break;
   }
