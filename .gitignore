@@ -51,3 +51,14 @@ benchmark/
 
 # memory compression backups
 memory-backups/
+
+# ── runtime state / caches / backups (not source) — added during consolidation ──
+*.bak
+*.bak-*
+*.bak.*
+core
+birdeye-gems-cache.json
+overnight_*.md
+user-config.json
+user-config.json.*
+reports/

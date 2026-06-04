@@ -9,6 +9,7 @@ import {
   closePosition,
   recenterPosition,
   searchPools,
+  estimateCloseSlippage,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
@@ -21,7 +22,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
-import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { getRecentDecisions } from "../decision-log.js";
 import { challengeDeploy } from "../challenger.js";
 import fs from "fs";
@@ -301,6 +302,7 @@ const toolMap = {
   remove_strategy:     removeStrategy,
   get_pool_memory: getPoolMemory,
   add_pool_note: addPoolNote,
+  estimate_close_slippage: estimateCloseSlippage,
   add_to_blacklist: addToBlacklist,
   remove_from_blacklist: removeFromBlacklist,
   list_blacklist: listBlacklist,
@@ -557,6 +559,52 @@ const PROTECTED_TOOLS = new Set([
 /**
  * Execute a tool call with safety checks and logging.
  */
+// Levenshtein distance for fuzzy address matching.
+function _levenshtein(a, b) {
+  if (a === b) return 0;
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp = new Array(n + 1);
+  for (let j = 0; j <= n; j++) dp[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j];
+      if (a[i - 1] === b[j - 1]) dp[j] = prev;
+      else dp[j] = 1 + Math.min(prev, dp[j], dp[j - 1]);
+      prev = tmp;
+    }
+  }
+  return dp[n];
+}
+
+// LLMs occasionally swap adjacent characters in 44-char base58 position addresses
+// (observed 2026-06-01: Helm typed ...thnhbDk... instead of ...thnbhDk..., a
+// 2-char swap). Auto-correct close/pnl/recenter calls when the typed address is
+// within edit distance 2 of exactly one live position.
+async function _resolvePositionAddress(typed) {
+  if (typeof typed !== "string" || typed.length < 32) return typed;
+  try {
+    const { positions } = await getMyPositions({ silent: true });
+    if (!Array.isArray(positions) || positions.length === 0) return typed;
+    if (positions.some((p) => p.position === typed)) return typed; // exact match
+    const matches = positions
+      .map((p) => ({ addr: p.position, dist: _levenshtein(typed, p.position) }))
+      .filter((m) => m.dist <= 2)
+      .sort((a, b) => a.dist - b.dist);
+    if (matches.length === 0) return typed;
+    if (matches.length === 1 || matches[0].dist < matches[1].dist) {
+      console.log(`[executor] address fuzzy-corrected ${typed} -> ${matches[0].addr} (dist=${matches[0].dist})`);
+      return matches[0].addr;
+    }
+    return typed; // ambiguous, let downstream reject
+  } catch (e) {
+    return typed; // best-effort
+  }
+}
+
 export async function executeTool(name, args) {
   const startTime = Date.now();
 
@@ -569,6 +617,12 @@ export async function executeTool(name, args) {
     const error = `Unknown tool: ${name}`;
     log("error", error);
     return { error };
+  }
+
+  // ─── Position-address fuzzy correction ────
+  if (args && typeof args.position_address === "string"
+      && ["close_position", "get_position_pnl", "recenter_position", "estimate_close_slippage", "claim_fees", "set_position_note"].includes(name)) {
+    args.position_address = await _resolvePositionAddress(args.position_address);
   }
 
   // ─── Pre-execution safety checks ──────────
@@ -742,6 +796,28 @@ async function runSafetyChecks(name, args) {
           reason: `bins_below ${args.bins_below ?? "missing"} is below minimum ${minBinsBelow}. Refusing 1-bin/tiny-range deploy.`,
         };
       }
+      // Size-aware per-bin liquidity floor. Cap bins_below by
+      // position_usd / targetPerBinUsd so small positions concentrate to viable density.
+      // SOL price proxy from $80 is fine — we don't need precision here.
+      if (
+        isSingleSidedSol &&
+        args.downside_pct == null &&
+        Number.isFinite(requestedBinsBelow) &&
+        requestedBinsBelow > 0
+      ) {
+        const target = Number(config.strategy.targetPerBinUsd ?? 1.5);
+        const solPriceProxy = 80;
+        const positionUsd = deployAmountY * solPriceProxy;
+        if (Number.isFinite(target) && target > 0 && positionUsd > 0) {
+          const sizeCapBins = Math.max(minBinsBelow, Math.floor(positionUsd / target));
+          if (requestedBinsBelow > sizeCapBins) {
+            return {
+              pass: false,
+              reason: `bins_below ${requestedBinsBelow} dilutes liquidity to ~$${(positionUsd / requestedBinsBelow).toFixed(2)}/bin (target $${target.toFixed(2)}). With $${positionUsd.toFixed(0)} deploy, max bins_below is ${sizeCapBins}. Narrow the range to ${sizeCapBins} (or fewer) or skip this candidate.`,
+            };
+          }
+        }
+      }
       if (
         isSingleSidedSol &&
         args.upside_pct == null &&
@@ -784,8 +860,8 @@ async function runSafetyChecks(name, args) {
         }
       }
 
-      // Check amount limits
-      const amountY = deployAmountY;
+      // Check amount limits (let, because executor may resize below based on confidence)
+      let amountY = deployAmountY;
       if (!Number.isFinite(amountY) || amountY <= 0) {
         return {
           pass: false,
@@ -793,8 +869,12 @@ async function runSafetyChecks(name, args) {
         };
       }
 
+      // Skip the floor check when a confidence is provided — computeDeployAmount
+      // will respect the floor itself, and confidence-scaled deploys may legitimately
+      // be smaller than deployAmountSol on a low-conviction PROCEED.
+      const hasConf = typeof args.confidence === "number" && Number.isFinite(args.confidence);
       const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-      if (amountY < minDeploy) {
+      if (!hasConf && amountY < minDeploy) {
         return {
           pass: false,
           reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
@@ -807,15 +887,90 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check SOL balance
+      // Hard block: confidence < 0.85 = SKIP. Also: confidence must be PROVIDED.
+      // Scout cannot bypass the rule by omitting the parameter. Pass confidence as a number
+      // in [0,1] from Argus's verdict on every deploy_position call.
+      if (typeof args.confidence !== "number" || !Number.isFinite(args.confidence)) {
+        return {
+          pass: false,
+          reason: `confidence parameter is REQUIRED. Pass Argus's PROCEED confidence (0..1) so the executor can size and gate the deploy. Omitting confidence is treated as a soft VETO.`,
+        };
+      }
+      if (args.confidence < 0.81) {
+        return {
+          pass: false,
+          reason: `Confidence ${args.confidence} is below the 0.81 hard floor (was 0.80; tightened 2026-06-02 after marginal-0.80 deploys losing money). Argus PROCEED must be > 0.80 to qualify.`,
+        };
+      }
+
+      // Hard block: live pool TVL too thin. Even if screening passed, by deploy time TVL may have drifted.
+      // A thin pool means exit slippage will be punishing. Refuse at this threshold.
+      if (process.env.DRY_RUN !== "true" && args.pool_address) {
+        try {
+          const detail = await getPoolDetail({ pool_address: args.pool_address, timeframe: "1h" });
+          const liveTvl = detail?.pool_tvl ?? detail?.tvl ?? null;
+          const minPoolTvl = config.screening.minPoolTvlAtDeploy ?? 12000;
+          if (liveTvl != null && Number.isFinite(liveTvl) && liveTvl < minPoolTvl) {
+            return {
+              pass: false,
+              reason: `Live pool TVL $${Math.round(liveTvl)} is below minPoolTvlAtDeploy ($${minPoolTvl}). Exit slippage would be punitive. Skip this candidate.`,
+            };
+          }
+        } catch (e) {
+          // Best-effort: if pool detail fails, do NOT block — fall through to other checks
+        }
+      }
+
+      // Authoritative position sizing + balance check (resize BEFORE checking balance)
       if (process.env.DRY_RUN !== "true") {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
-        const minRequired = amountY + gasReserve;
+
+        // Step 1: compute authoritative size from TOTAL portfolio (wallet + open positions) + confidence
+        const confidence = (typeof args.confidence === "number" && Number.isFinite(args.confidence))
+          ? args.confidence
+          : null;
+        // Sum SOL value of currently-open positions
+        let openPositionsSol = 0;
+        try {
+          const portfolio = await getMyPositions({ force: true, silent: true });
+          const positions = portfolio?.positions || [];
+          const solPrice = balance.sol_price || 0;
+          if (solPrice > 0) {
+            for (const p of positions) {
+              const usd = p.total_value_usd ?? p.total_value_true_usd ?? 0;
+              openPositionsSol += usd / solPrice;
+            }
+          }
+        } catch (e) {
+          // best-effort; sizing falls back to wallet-only if portfolio fetch fails
+        }
+        const targetDeploy = computeDeployAmount(balance.sol, confidence, openPositionsSol);
+
+        // Sizing returned 0 = portfolio too small to deploy a viable
+        // (>= minSolToOpen) position. Refuse the deploy entirely.
+        if (targetDeploy <= 0) {
+          const minViable = config.management.minSolToOpen ?? 0.55;
+          return {
+            pass: false,
+            reason: `Computed deploy size is below minSolToOpen (${minViable} SOL). Total portfolio (wallet ${balance.sol.toFixed(3)} + open ${openPositionsSol.toFixed(3)} - gas ${gasReserve}) too small to open a viable position. Skip cycle or close existing positions first.`,
+          };
+        }
+
+        if (Math.abs(amountY - targetDeploy) > 0.001) {
+          console.log(`[executor] resizing amount_y ${amountY} -> ${targetDeploy} SOL (confidence=${confidence ?? "n/a"})`);
+        }
+        // Mutate args so downstream deployPosition uses executor-computed amount
+        args.amount_y = targetDeploy;
+        args.amount_sol = targetDeploy;
+        amountY = targetDeploy;
+
+        // Step 2: balance check against the resized amount
+        const minRequired = targetDeploy + gasReserve;
         if (balance.sol < minRequired) {
           return {
             pass: false,
-            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
+            reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired.toFixed(3)} SOL (${targetDeploy} deploy + ${gasReserve} gas reserve).`,
           };
         }
       }

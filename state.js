@@ -60,6 +60,7 @@ export function trackPosition({
   strategy,
   bin_range = {},
   amount_sol,
+  original_amount_sol,
   amount_x = 0,
   active_bin,
   bin_step,
@@ -77,6 +78,10 @@ export function trackPosition({
     strategy,
     bin_range,
     amount_sol,
+    // original_amount_sol — immutable across recenters. Set on first deploy;
+    // recenter explicitly forwards the prior value so the cap math stays anchored
+    // to the first-ever deploy size. Defaults to amount_sol on fresh deploys.
+    original_amount_sol: original_amount_sol ?? amount_sol,
     amount_x,
     active_bin_at_deploy: active_bin,
     bin_step,

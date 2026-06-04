@@ -243,3 +243,61 @@ export async function swapToken({
     return { success: false, error: error.message };
   }
 }
+// Append to wallet.js
+export async function estimateSwapSlippage({ input_mint, output_mint, amount, decimals_override }) {
+  input_mint  = normalizeMint(input_mint);
+  output_mint = normalizeMint(output_mint);
+
+  const wallet = getWallet();
+  const connection = getConnection();
+
+  // Resolve decimals
+  let decimals = decimals_override ?? 9;
+  if (decimals_override == null && input_mint !== config.tokens.SOL) {
+    try {
+      const mintInfo = await connection.getParsedAccountInfo(new PublicKey(input_mint));
+      decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+    } catch { /* keep default */ }
+  }
+  const amountStr = Math.floor(amount * Math.pow(10, decimals)).toString();
+
+  // Get a Jupiter quote (don't execute)
+  const search = new URLSearchParams({
+    inputMint: input_mint,
+    outputMint: output_mint,
+    amount: amountStr,
+    taker: wallet.publicKey.toString(),
+  });
+  const orderUrl = `${JUPITER_SWAP_V2_API}/order?${search.toString()}`;
+  const jupiterApiKey = getJupiterApiKey();
+  const res = await fetch(orderUrl, { headers: jupiterApiKey ? { "x-api-key": jupiterApiKey } : {} });
+  if (!res.ok) {
+    return { ok: false, error: `Jupiter order failed: ${res.status}` };
+  }
+  const order = await res.json();
+  if (order.errorCode || order.errorMessage) {
+    return { ok: false, error: order.errorMessage || order.errorCode };
+  }
+
+  // Jupiter returns outAmount (raw units, no decimals applied)
+  // For SOL output, decimals = 9
+  const outRaw = parseFloat(order.outAmount || order.quoteResponse?.outAmount || 0);
+  const outDecimals = output_mint === config.tokens.SOL ? 9 : 6;
+  const outAmount = outRaw / Math.pow(10, outDecimals);
+
+  // Try to get price impact and slippage from order
+  const priceImpactPct = parseFloat(order.priceImpactPct ?? order.quoteResponse?.priceImpactPct ?? 0);
+  const slippageBps = parseInt(order.slippageBps ?? order.quoteResponse?.slippageBps ?? 0);
+
+  return {
+    ok: true,
+    input_mint,
+    output_mint,
+    input_amount: amount,
+    input_decimals: decimals,
+    expected_output: outAmount,
+    price_impact_pct: priceImpactPct,
+    slippage_bps: slippageBps,
+    raw_order: { outAmount: order.outAmount, priceImpactPct: order.priceImpactPct },
+  };
+}

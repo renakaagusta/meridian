@@ -460,6 +460,7 @@ export async function deployPosition({
   organic_score,
   initial_value_usd,
   skipCooldown = false, // set by recenterPosition — re-entering the same pool we just closed
+  original_amount_sol = null, // set by recenterPosition to preserve immutable original deploy size
 }) {
   pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
@@ -692,6 +693,7 @@ export async function deployPosition({
           fee_tvl_ratio,
           organic_score,
           amount_sol: finalAmountY,
+          original_amount_sol: original_amount_sol ?? finalAmountY,
           amount_x: finalAmountX,
           active_bin: activeBin.binId,
           initial_value_usd,
@@ -836,6 +838,7 @@ export async function deployPosition({
       fee_tvl_ratio,
       organic_score,
       amount_sol: finalAmountY,
+      original_amount_sol: original_amount_sol ?? finalAmountY,
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
       initial_value_usd: entryValueUsd,
@@ -2096,6 +2099,25 @@ export async function recenterPosition({ position_address, bins_below, strategy,
   const tracked = getTrackedPosition(position_address);
   const poolAddress = pos.pool;
 
+  // Pre-flight: if redeploy is guaranteed to abort, skip the close so the
+  // position stays open instead of becoming a half-recentered orphan.
+  // Use the IMMUTABLE original_amount_sol (not the current amount_sol which
+  // grows under "grow + cap" recenter rules).
+  const originalAmount = tracked?.original_amount_sol ?? tracked?.amount_sol ?? null;
+  if (originalAmount) {
+    const projectedCap = originalAmount * 1.5;
+    if (projectedCap < config.management.minSolToOpen) {
+      return {
+        success: false,
+        stage: "preflight",
+        skipped_close: true,
+        error: `recenter aborted: 1.5× original (${projectedCap.toFixed(3)} SOL) is below minSolToOpen (${config.management.minSolToOpen}). Position is unchanged. If in-range with healthy pool, HOLD is usually correct. Only close_position if 2+ degradation signals fire or the pool is dying.`,
+        original_amount_sol: originalAmount,
+        min_sol_to_open: config.management.minSolToOpen,
+      };
+    }
+  }
+
   // 1. Close (removes liquidity + claims fees)
   const closed = await closePosition({ position_address, reason });
   if (!closed.success) return { success: false, stage: "close", error: closed.error };
@@ -2111,20 +2133,138 @@ export async function recenterPosition({ position_address, bins_below, strategy,
     } catch (e) { log("recenter_warn", `swap base→SOL failed: ${e.message}`); }
   }
 
-  // 3. Compute redeploy size from reclaimed SOL (minus gas), capped near original
+  // 3. Compute redeploy size: GROW with cap.
+  //
+  // "Grow" — position can scale up by 1.5× per recenter so winners compound.
+  // "Cap"  — never beyond min(2× original deploy, portfolio × maxPositionPctOfPortfolio).
+  //
+  // The cap is anchored to original_amount_sol (immutable) NOT amount_sol
+  // (which mutates each recenter). Without this anchor, 1.5× compounds
+  // unboundedly (observed 2026-06-01: JTVO grew 0.55 → 0.83 → 0.93 → wallet
+  // drained, 87% portfolio in one position).
   const bal = await getWalletBalances({});
   const deployable = Math.max(0, (bal.sol || 0) - config.management.gasReserve);
-  const cap = tracked?.amount_sol ? tracked.amount_sol * 1.5 : deployable;
-  const amount = Math.min(deployable, cap);
+  const portfolioMaxPct = config.risk.maxPositionPctOfPortfolio ?? 0.5;
+  const originalForCap = tracked?.original_amount_sol ?? tracked?.amount_sol ?? null;
+
+  // Sum SOL value of all currently-open positions (for portfolio computation).
+  let openPositionsSol = 0;
+  try {
+    const livePf = await getMyPositions({ force: false, silent: true });
+    const solPrice = bal.sol_price || 0;
+    if (solPrice > 0) {
+      for (const p of (livePf?.positions || [])) {
+        const usd = p.total_value_usd ?? p.total_value_true_usd ?? 0;
+        openPositionsSol += usd / solPrice;
+      }
+    }
+  } catch (e) { /* best-effort */ }
+  const totalSol = (bal.sol || 0) + openPositionsSol;
+  const portfolioCap = totalSol * portfolioMaxPct;
+
+  const growthCap = originalForCap ? originalForCap * 2 : deployable;       // never beyond 2× original
+  const currentGrowCap = tracked?.amount_sol ? tracked.amount_sol * 1.5 : deployable;  // per-recenter 1.5× step
+  const ceiling = Math.min(growthCap, portfolioCap);
+  const amount = Math.min(deployable, currentGrowCap, ceiling);
+
   if (amount < config.management.minSolToOpen) {
-    return { success: false, stage: "redeploy", error: `insufficient SOL to redeploy (${amount.toFixed(3)})`, closed_pnl_pct: closed.pnl_pct, swapped };
+    return { success: false, stage: "redeploy", error: `insufficient SOL to redeploy (${amount.toFixed(3)} — caps: growth=${growthCap.toFixed(3)}, portfolio=${portfolioCap.toFixed(3)}, deployable=${deployable.toFixed(3)})`, closed_pnl_pct: closed.pnl_pct, swapped };
   }
 
-  // 4. Redeploy single-sided SOL around the CURRENT active bin (deployPosition fetches it)
+  // 4. Redeploy single-sided SOL around the CURRENT active bin (deployPosition fetches it).
+  //    Pass the immutable original_amount_sol so the new tracked entry preserves it.
   const deployed = await deployPosition({
     pool_address: poolAddress, amount_y: amount, bins_below, strategy,
     pool_name: pos.pair, skipCooldown: true,
+    original_amount_sol: originalForCap,
   });
   log("recenter", `${pos.pair}: closed (pnl ${closed.pnl_pct}%) → redeployed ${amount.toFixed(3)} SOL around new active bin (${deployed.success ? "ok" : "FAILED: " + deployed.error})`);
   return { success: !!deployed.success, recentered: true, closed_pnl_pct: closed.pnl_pct, swapped, deployed };
+}
+// Append to dlmm.js
+import { estimateSwapSlippage as _estimateSwapSlippage } from "./wallet.js";
+
+export async function estimateCloseSlippage({ position_address }) {
+  if (!position_address) return { ok: false, error: "position_address required" };
+  position_address = normalizeMint(position_address);
+
+  // Pull all positions, find the matching one
+  const portfolio = await getMyPositions({ force: true, silent: true });
+  const positions = portfolio?.positions || [];
+  const pos = positions.find((p) => p.position === position_address);
+  if (!pos) return { ok: false, error: `Position ${position_address} not found` };
+
+  // Position composition: base_amount (token X) + quote_amount (SOL)
+  // Use what Meteora portfolio API gives us
+  const baseMint   = pos.base?.mint   || pos.base_mint || null;
+  const quoteMint  = pos.quote?.mint  || pos.quote_mint || "So11111111111111111111111111111111111111112";
+  const baseAmount = parseFloat(pos.base?.amount  || pos.amount_x || pos.x_amount || 0);
+  const quoteAmount= parseFloat(pos.quote?.amount || pos.amount_y || pos.y_amount || 0);
+  const baseUsd    = parseFloat(pos.base?.usd     || pos.amount_x_usd || 0);
+  const quoteUsd   = parseFloat(pos.quote?.usd    || pos.amount_y_usd || 0);
+  const baseDecimals = pos.base?.decimals ?? 6;  // memecoins typically 6
+  const totalValueUsd = parseFloat(pos.total_value_usd || pos.total_value_true_usd || 0) || (baseUsd + quoteUsd);
+
+  if (!baseMint) {
+    return { ok: false, error: "Could not resolve base token mint from position" };
+  }
+  if (baseAmount <= 0) {
+    return {
+      ok: true,
+      position_address,
+      no_swap_needed: true,
+      reason: "Position contains 0 base token — no swap on close",
+      base_amount: 0,
+      quote_amount: quoteAmount,
+      expected_proceeds_sol: quoteAmount,
+    };
+  }
+
+  // Call Jupiter to estimate the base->SOL swap impact
+  const quote = await _estimateSwapSlippage({
+    input_mint: baseMint,
+    output_mint: quoteMint,
+    amount: baseAmount,
+    decimals_override: baseDecimals,
+  });
+
+  if (!quote.ok) {
+    return { ok: false, error: `Jupiter quote failed: ${quote.error}`, baseMint, baseAmount };
+  }
+
+  // Expected SOL from base swap + the SOL already in the position
+  const expectedSwapSol = quote.expected_output;
+  const expectedProceedsSol = expectedSwapSol + quoteAmount;
+
+  // SOL price for USD math
+  const { getWalletBalances } = await import("./wallet.js");
+  const bal = await getWalletBalances({ silent: true });
+  const solPrice = bal.sol_price || 0;
+  const expectedProceedsUsd = expectedProceedsSol * solPrice;
+
+  // Slippage USD: spot value of position vs expected proceeds
+  const slippageUsd = totalValueUsd - expectedProceedsUsd;
+  const slippagePct = totalValueUsd > 0 ? (slippageUsd / totalValueUsd) * 100 : null;
+
+  return {
+    ok: true,
+    position_address,
+    base_mint: baseMint,
+    base_amount: baseAmount,
+    base_value_usd: baseUsd,
+    quote_amount_sol: quoteAmount,
+    quote_value_usd: quoteUsd,
+    total_position_value_usd: totalValueUsd,
+    expected_swap_output_sol: expectedSwapSol,
+    expected_proceeds_sol: expectedProceedsSol,
+    expected_proceeds_usd: expectedProceedsUsd,
+    estimated_slippage_usd: slippageUsd,
+    estimated_slippage_pct: slippagePct,
+    jupiter_price_impact_pct: quote.price_impact_pct,
+    interpretation: slippagePct == null
+      ? "no value to compare"
+      : (slippagePct > 5 ? "HIGH — closing would eat >5%, prefer hold/recenter unless pool dying"
+         : slippagePct > 2 ? "MODERATE — 2-5% slippage, factor into PnL"
+         : "LOW — closing is cheap enough"),
+  };
 }

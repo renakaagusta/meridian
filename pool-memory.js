@@ -168,6 +168,21 @@ export function recordPoolDeploy(poolAddress, deployData) {
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
   }
 
+  // Big-loss blacklist: any close worse than -15% PnL bans the pool AND base mint
+  // for 7 days. A -37% disaster (锄头-SOL 2026-05-29) should not get re-deployed.
+  // Catastrophic losses indicate the pool's structure is wrong for our strategy,
+  // not just a transient market move.
+  const bigLossPct = Number(config.management.bigLossCooldownPct ?? -15);
+  const bigLossHours = Number(config.management.bigLossCooldownHours ?? 168);
+  if (Number.isFinite(deploy.pnl_pct) && deploy.pnl_pct <= bigLossPct) {
+    const reason = `big-loss ban: closed at ${deploy.pnl_pct.toFixed(2)}% (≤ ${bigLossPct}%)`;
+    setPoolCooldown(entry, bigLossHours, reason);
+    if (entry.base_mint) {
+      setBaseMintCooldown(db, entry.base_mint, bigLossHours, reason);
+    }
+    log("pool-memory", `BIG-LOSS BAN ${entry.name} pool+mint for ${bigLossHours}h (PnL ${deploy.pnl_pct}%)`);
+  }
+
   const oorTriggerCount = config.management.oorCooldownTriggerCount ?? 3;
   const oorCooldownHours = config.management.oorCooldownHours ?? 12;
   const recentDeploys = entry.deploys.slice(-oorTriggerCount);
