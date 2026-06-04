@@ -259,6 +259,18 @@ const { values: flags } = parseArgs({
     trigger:      { type: "string" },
     force:        { type: "boolean" },
     "max-owners": { type: "string" },
+    chain:        { type: "string" },
+    res:          { type: "string" },
+    count:        { type: "string" },
+    size:         { type: "string" },
+    type:         { type: "string" },
+    sort:         { type: "string" },
+    "sort-type":  { type: "string" },
+    tf:           { type: "string" },
+    "min-change": { type: "string" },
+    "max-change": { type: "string" },
+    "min-tvl":    { type: "string" },
+    "min-volume": { type: "string" },
   },
   allowPositionals: true,
   strict: false,
@@ -762,6 +774,138 @@ switch (subcommand) {
     if (!mint) die("Usage: meridian pumpfun --mint <token_mint>");
     const { getPumpfunStatus } = await import("./tools/external-signals.js");
     out(await getPumpfunStatus({ mint }));
+    break;
+  }
+
+  // ── birdeye-gems — keyless Birdeye trending list (accurate velocity) ──
+  case "birdeye-gems": {
+    const { getBirdeyeGems } = await import("./tools/birdeye.js");
+    out(await getBirdeyeGems({
+      chain: flags.chain || "solana",
+      type: flags.type || "trending",
+      sort_by: flags.sort || "tf24h.volumeChangePercent",
+      sort_type: flags["sort-type"] || "desc",
+      limit: flags.limit ? parseInt(flags.limit) : 50,
+      shown_time_frame: flags.tf || "24h",
+    }));
+    break;
+  }
+
+  // ── agent-health — per-agent health snapshot for Atlas (detection only) ──
+  case "agent-health": {
+    const { getAgentHealth } = await import("./tools/agent-health.js");
+    out(await getAgentHealth());
+    break;
+  }
+
+  // ── notify --text "..." — send a Telegram alert (used by Atlas health sweep) ──
+  case "notify": {
+    const text = flags.text || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "notify");
+    if (!text) die("Usage: meridian notify --text \"<message>\"");
+    const tg = await import("./telegram.js");
+    if (!tg.isEnabled()) { out({ sent: false, reason: "telegram not configured" }); break; }
+    const res = await tg.sendMessage(`🛰️ Atlas alert: ${text}`).catch((e) => ({ error: e.message }));
+    out({ sent: !res?.error, result: res?.error || "ok" });
+    break;
+  }
+
+  // ── momentum-candidates — Hunter's momentum-tuned spot candidate list ──
+  case "momentum-candidates": {
+    const { getMomentumCandidates } = await import("./tools/birdeye.js");
+    out(await getMomentumCandidates({
+      limit: flags.limit ? parseInt(flags.limit) : 5,
+      min_change: flags["min-change"] != null ? parseFloat(flags["min-change"]) : 3,
+      max_change: flags["max-change"] != null ? parseFloat(flags["max-change"]) : 80,
+      min_tvl: flags["min-tvl"] != null ? parseFloat(flags["min-tvl"]) : 20000,
+      min_volume: flags["min-volume"] != null ? parseFloat(flags["min-volume"]) : 0,
+      chain: flags.chain || "solana",
+    }));
+    break;
+  }
+
+  // ── birdeye-velocity --mint <addr> — accurate 30m/1h/2h/4h/24h velocity ─
+  case "birdeye-velocity": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-velocity --mint <token_mint>");
+    const { getBirdeyeVelocity } = await import("./tools/birdeye.js");
+    out(await getBirdeyeVelocity({ mint, chain: flags.chain || "solana" }));
+    break;
+  }
+
+  // ── birdeye-ohlcv --mint <addr> [--res 5m] [--count 60] — candles ─────
+  case "birdeye-ohlcv": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-ohlcv --mint <token_mint> [--res 5m] [--count 60]");
+    const { getBirdeyeOhlcv } = await import("./tools/birdeye.js");
+    out(await getBirdeyeOhlcv({
+      mint,
+      chain: flags.chain || "solana",
+      res: flags.res || "5m",
+      count: flags.count ? parseInt(flags.count) : 60,
+    }));
+    break;
+  }
+
+  // ── birdeye-security --mint <addr> — keyless token security/risk ───────
+  case "birdeye-security": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-security --mint <token_mint>");
+    const { getBirdeyeSecurity } = await import("./tools/birdeye.js");
+    out(await getBirdeyeSecurity({ mint, chain: flags.chain || "solana" }));
+    break;
+  }
+
+  // ── birdeye-token-stats --mint <addr> [--timeframe 24h] — native 5m/8h multi-TF liveness ─
+  case "birdeye-token-stats": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-token-stats --mint <token_mint> [--timeframe 24h]");
+    const { getBirdeyeTokenStats } = await import("./tools/birdeye.js");
+    out(await getBirdeyeTokenStats({ mint, chain: flags.chain || "solana", timeframe: flags.timeframe || "24h" }));
+    break;
+  }
+
+  // ── birdeye-holders --mint <addr> [--size 20] — ranked live top holders ─
+  case "birdeye-holders": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-holders --mint <token_mint> [--size 20]");
+    const { getBirdeyeHolders } = await import("./tools/birdeye.js");
+    out(await getBirdeyeHolders({ mint, chain: flags.chain || "solana", size: flags.size ? parseInt(flags.size) : 20 }));
+    break;
+  }
+
+  // ── birdeye-markets --mint <addr> — all markets/pools for a token ─
+  case "birdeye-markets": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian birdeye-markets --mint <token_mint>");
+    const { getBirdeyeMarkets } = await import("./tools/birdeye.js");
+    out(await getBirdeyeMarkets({ mint, chain: flags.chain || "solana" }));
+    break;
+  }
+
+  // ── gmgn-wallet-tags --mint <addr> — keyless GMGN wallet-cohort counts ─
+  case "gmgn-wallet-tags": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian gmgn-wallet-tags --mint <token_mint>");
+    const { getGmgnWalletTags } = await import("./tools/gmgn.js");
+    out(await getGmgnWalletTags({ mint, chain: flags.chain || "sol" }));
+    break;
+  }
+
+  // ── gmgn-top-buyers --mint <addr> — early-buyer dump status ─
+  case "gmgn-top-buyers": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian gmgn-top-buyers --mint <token_mint>");
+    const { getGmgnTopBuyers } = await import("./tools/gmgn.js");
+    out(await getGmgnTopBuyers({ mint, chain: flags.chain || "sol" }));
+    break;
+  }
+
+  // ── gmgn-pool-fee --mint <addr> — per-pool fee config (Meteora) ─
+  case "gmgn-pool-fee": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian gmgn-pool-fee --mint <token_mint>");
+    const { getGmgnPoolFee } = await import("./tools/gmgn.js");
+    out(await getGmgnPoolFee({ mint, chain: flags.chain || "sol" }));
     break;
   }
 

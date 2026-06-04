@@ -192,7 +192,8 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           volatility: { type: "number", description: "Pool volatility at deploy time, sourced from max(screening timeframe, 30m)" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
-          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }
+          initial_value_usd: { type: "number", description: "Estimated USD value being deployed" },
+          confidence: { type: "number", description: "Argus's PROCEED confidence (0..1). The executor uses this to scale position size: 0.85 = 50%, 0.95+ = 100% of computeDeployAmount. Always pass the confidence from the PROCEED verdict you received." }
         },
         required: ["pool_address"]
       }
@@ -283,6 +284,20 @@ This is how top LP performers keep fees flowing. Executes real on-chain transact
     },
   },
 
+  {
+    type: "function",
+    function: {
+      name: "estimate_close_slippage",
+      description: "Estimate slippage cost of closing a specific position right now via Jupiter quote (no transaction). Use BEFORE every close decision: if estimated_slippage_pct > 5%, prefer hold or recenter unless the pool is genuinely dying.",
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: { type: "string", description: "The position public key to estimate close slippage for." }
+        },
+        required: ["position_address"]
+      }
+    }
+  },
   {
     type: "function",
     function: {

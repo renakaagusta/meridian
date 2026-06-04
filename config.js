@@ -26,7 +26,7 @@ const DEFAULT_HIVEMIND_API_KEY = DEFAULT_AGENT_MERIDIAN_PUBLIC_KEY;
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
-export const MIN_SAFE_BINS_BELOW = 35;
+export const MIN_SAFE_BINS_BELOW = 20;
 
 function numericConfig(value) {
   const n = Number(value);
@@ -71,6 +71,11 @@ export const config = {
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
+    // Hard ceiling per position as fraction of total portfolio (wallet + open positions).
+    // Default 0.5 = no single position exceeds 50% of portfolio. Defends against the
+    // runaway-recenter pattern observed 2026-06-01 (JTVO grew to 87% of portfolio
+    // via repeated 1.5× recenters draining the wallet).
+    maxPositionPctOfPortfolio: u.maxPositionPctOfPortfolio ?? 0.5,
   },
 
   // ─── Pool Screening Thresholds ───────────
@@ -78,6 +83,7 @@ export const config = {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
     minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
     minTvl:            u.minTvl            ?? 10_000,
+    minPoolTvlAtDeploy: u.minPoolTvlAtDeploy ?? 12_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
     minOrganic:        u.minOrganic        ?? 60,
@@ -147,10 +153,14 @@ export const config = {
 
   // ─── Strategy Mapping ───────────────────
   strategy: {
-    strategy:     u.strategy     ?? "bid_ask",
-    minBinsBelow: strategyMinBinsBelow,
-    maxBinsBelow: strategyMaxBinsBelow,
+    strategy:         u.strategy         ?? "bid_ask",
+    minBinsBelow:     strategyMinBinsBelow,
+    maxBinsBelow:     strategyMaxBinsBelow,
     defaultBinsBelow: strategyDefaultBinsBelow,
+    // Size-aware bin width: never spread liquidity thinner than this $/bin.
+    // bins_below cap = position_usd / targetPerBinUsd. Today's deploys averaged
+    // $0.25/bin which earns nothing; $1.50 puts us in fee-capture range.
+    targetPerBinUsd:  u.targetPerBinUsd  ?? 1.5,
   },
 
   // ─── Scheduling ─────────────────────────
@@ -259,15 +269,35 @@ export const config = {
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
-export function computeDeployAmount(walletSol) {
-  const reserve  = config.management.gasReserve      ?? 0.2;
-  const pct      = config.management.positionSizePct ?? 0.35;
-  const floor    = config.management.deployAmountSol;
-  const ceil     = config.risk.maxDeployAmount;
-  const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
-  return parseFloat(result.toFixed(2));
+export function computeDeployAmount(walletSol, confidence = null, openPositionsSol = 0) {
+  const reserve     = config.management.gasReserve      ?? 0.2;
+  const pct         = config.management.positionSizePct ?? 0.35;
+  const minViable   = config.management.minSolToOpen    ?? 0.55;
+  const ceil        = config.risk.maxDeployAmount;
+  const totalSol    = walletSol + (openPositionsSol || 0);
+  const deployable  = Math.max(0, totalSol - reserve);
+
+  // Confidence scaling: 0.80 -> 0.5x, 0.95+ -> 1.0x. Linear in between.
+  let convScale = 1.0;
+  if (typeof confidence === "number" && Number.isFinite(confidence)) {
+    const c = Math.max(0, Math.min(1, confidence));
+    if (c < 0.80) convScale = 0.5;
+    else if (c >= 0.95) convScale = 1.0;
+    else convScale = 0.5 + ((c - 0.80) / 0.15) * 0.5;
+  }
+
+  const dynamic = deployable * pct * convScale;
+
+  // Hard floor at minSolToOpen: smaller positions cannot recoup gas before
+  // typical OOR timing on memecoin pools (~$0.40 round-trip gas; a $20 position
+  // needs 2.5% fees just to break even). Scale up to minViable when we have
+  // the SOL; return 0 (skip signal) when we don't.
+  if (dynamic < minViable) {
+    if (deployable >= minViable) return parseFloat(minViable.toFixed(3));
+    return 0;
+  }
+
+  return parseFloat(Math.min(ceil, dynamic).toFixed(3));
 }
 
 /**

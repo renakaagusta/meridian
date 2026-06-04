@@ -1,5 +1,6 @@
 import fs from "fs";
 import { log } from "./logger.js";
+import { appendDecisionTrace } from "./tools/decision-trace.js";
 
 const DECISION_LOG_FILE = "./decision-log.json";
 const MAX_DECISIONS = 100;
@@ -44,6 +45,11 @@ export function appendDecision(entry) {
   data.decisions.unshift(decision);
   data.decisions = data.decisions.slice(0, MAX_DECISIONS);
   save(data);
+  // Mirror deploys to the append-only decision trace so the counterfactual
+  // checker can exclude pools we actually entered from the "skipped" set (#11).
+  if (decision.type === "deploy" && decision.pool) {
+    appendDecisionTrace({ cycle: "deploy", decision: { pool: decision.pool } });
+  }
   return decision;
 }
 
