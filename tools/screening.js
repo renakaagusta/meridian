@@ -780,6 +780,31 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     }
   }
 
+  // Decision trace for counterfactual calibration (#11): snapshot the candidate
+  // set this cycle considered. decision.pool stays null here; deployPosition logs
+  // a separate "deploy" trace the counterfactual uses to exclude entered pools.
+  try {
+    const { appendDecisionTrace } = await import("./decision-trace.js");
+    appendDecisionTrace({
+      cycle: "screening",
+      inputs: {
+        total_screened: pools.length,
+        candidates: eligible.map((c) => ({
+          pool: c.pool,
+          name: c.name,
+          base_mint: c.base?.mint ?? null,
+          fee_active_tvl_ratio: c.fee_active_tvl_ratio ?? null,
+          volume_window: c.volume ?? null,
+          tvl: c.tvl ?? null,
+          mcap: c.mcap ?? null,
+          organic_score: c.organic_score ?? null,
+          active_pct: c.active_pct ?? null,
+        })),
+      },
+      decision: { pool: null },
+    });
+  } catch { /* non-fatal */ }
+
   return {
     candidates: eligible,
     total_screened: pools.length,
