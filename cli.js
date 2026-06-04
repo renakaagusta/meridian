@@ -790,6 +790,24 @@ switch (subcommand) {
     break;
   }
 
+  // ── agent-health — per-agent health snapshot for Atlas (detection only) ──
+  case "agent-health": {
+    const { getAgentHealth } = await import("./tools/agent-health.js");
+    out(await getAgentHealth());
+    break;
+  }
+
+  // ── notify --text "..." — send a Telegram alert (used by Atlas health sweep) ──
+  case "notify": {
+    const text = flags.text || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "notify");
+    if (!text) die("Usage: meridian notify --text \"<message>\"");
+    const tg = await import("./telegram.js");
+    if (!tg.isEnabled()) { out({ sent: false, reason: "telegram not configured" }); break; }
+    const res = await tg.sendMessage(`🛰️ Atlas alert: ${text}`).catch((e) => ({ error: e.message }));
+    out({ sent: !res?.error, result: res?.error || "ok" });
+    break;
+  }
+
   // ── momentum-candidates — Hunter's momentum-tuned spot candidate list ──
   case "momentum-candidates": {
     const { getMomentumCandidates } = await import("./tools/birdeye.js");
