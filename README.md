@@ -627,6 +627,39 @@ discord-listener/
 
 ---
 
+## Keyless Birdeye signals & PnL reporting
+
+**Birdeye signals (no API key).** Birdeye's `forge/*` data is rich but Cloudflare-gated,
+so Meridian fetches it through the [stackbase scraper](https://github.com/renakaagusta/stackbase)'s
+`POST /scrape/birdeye/forge` (real Chrome over a residential exit). Set
+`MERIDIAN_SCRAPER_URL` + `MERIDIAN_SCRAPER_SECRET`. CLI:
+
+```bash
+meridian birdeye-velocity --mint <mint>   # 5m/30m/1h/2h/4h/24h price+vol+buy/sell+unique wallets
+meridian birdeye-security --mint <mint>   # mint/freeze authority, renounce, creator %, top10 %
+meridian birdeye-gems   [--type trending] # keyless trending candidate list
+meridian birdeye-ohlcv  --mint <mint> --res 5m   # candles at any resolution (1s..1h)
+```
+
+`get_dex_velocity` automatically overlays `birdeye_velocity` (with a true 5m window
+computed from 1m candles) and falls back to DexScreener if the path is down.
+
+**Daily PnL reports.** On-demand LP + trade PnL with rolling 1d/3d/7d windows:
+
+```bash
+node --env-file=.env scripts/daily-pnl.js [--date YYYY-MM-DD]   # → reports/pnl/<date>.md + HISTORY.md
+```
+
+Covers wallet net worth, per-window realized PnL + wallet Δ, LP/trade stacks, missed
+opportunities (counterfactual + Birdeye sustain), and implementation health. See
+[`reports/pnl/RUNBOOK.md`](reports/pnl/RUNBOOK.md) for the procedure.
+
+**Counterfactual calibration.** `scripts/counterfactual-check.js` reads `decision-traces.jsonl`
+(emitted on every screen/deploy) and scores whether skipped pools sustained (missed) or
+collapsed (correct skip), cross-checked against Birdeye 24h volume.
+
+---
+
 ## Disclaimer
 
 This software is provided as-is, with no warranty. Running an autonomous trading agent carries real financial risk — you can lose funds. Always start with `DRY_RUN=true` to verify behavior before going live. Never deploy more capital than you can afford to lose. This is not financial advice.

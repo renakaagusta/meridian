@@ -26,10 +26,19 @@ tools/
   definitions.js    Tool schemas in OpenAI format (what LLM sees)
   executor.js       Tool dispatch: name → fn, safety checks, pre/post hooks
   dlmm.js           Meteora DLMM SDK wrapper (deploy, close, claim, positions, PnL)
-  screening.js      Pool discovery from Meteora API
+  screening.js      Pool discovery from Meteora API (+ emits screening decision-traces)
   wallet.js         SOL/token balances (Helius) + Jupiter swap
   token.js          Token info/holders/narrative (Jupiter API)
   study.js          Top LPer study via LPAgent API
+  external-signals.js DexScreener velocity / RugCheck / Pump.fun (get_dex_velocity overlays Birdeye)
+  birdeye.js        Keyless Birdeye velocity/security/gems/OHLCV via the stackbase scraper
+  decision-trace.js Append-only decision-traces.jsonl (feeds scripts/counterfactual-check.js)
+
+scripts/
+  daily-pnl.js            Daily LP+trade PnL report → reports/pnl/<date>.md (see reports/pnl/RUNBOOK.md)
+  backfill-pnl-history.js One-time HISTORY.md seed (on-chain EOD balance × SOL price)
+  counterfactual-check.js Scores skipped pools (sustained=missed vs collapsed) + Birdeye sustain
+  perf_pulse.py           Compact LP/trade/health pulse (used by live monitors)
 ```
 
 ---
@@ -219,6 +228,35 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 | `HIVE_MIND_URL` | No | Collective intelligence server |
 | `HIVE_MIND_API_KEY` | No | Hive mind auth token |
 | `HELIUS_API_KEY` | No | Enhanced wallet balance data |
+| `MERIDIAN_SCRAPER_URL` | No | stackbase scraper base URL for keyless Birdeye (default `https://scraper.stackbase.id`) |
+| `MERIDIAN_SCRAPER_SECRET` | No | Bearer token for the scraper (falls back to `SCRAPER_SECRET`) |
+
+---
+
+## Keyless Birdeye Signals (tools/birdeye.js)
+
+Birdeye's `forge/*` data (per-token velocity, security, trending gems, OHLCV) needs
+no API key but is Cloudflare-gated. We fetch it through the **stackbase scraper**'s
+`POST /scrape/birdeye/forge` (real Chrome over a residential exit). Tools:
+`get_birdeye_velocity` (30m+ overview + true **5m** from 1m OHLCV), `get_birdeye_security`,
+`get_birdeye_gems`, `get_birdeye_ohlcv`. `get_dex_velocity` overlays `birdeye_velocity`
+(set `velocity_source: "birdeye"`) and falls back to DexScreener if the path degrades
+(35s bound). No 5m exists in find-gems/overview — it's computed from `amm/ohlcv_v2`.
+
+## Daily PnL Reports (scripts/daily-pnl.js → reports/pnl/)
+
+On-demand (no cron): `node --env-file=.env scripts/daily-pnl.js [--date YYYY-MM-DD]`
+writes `reports/pnl/<date>.md` (wallet net worth, 1d/3d/7d period table, LP + trade
+stacks, missed-opps from the counterfactual, health) and upserts `reports/pnl/HISTORY.md`.
+**Full procedure + caveats: `reports/pnl/RUNBOOK.md`.** Generate on the server (data
+lives there), then commit the report from a clean checkout — never from `/root/meridian`
+(dirty runtime dir).
+
+## Counterfactual Calibration (scripts/counterfactual-check.js)
+
+`getTopCandidates` + `appendDecision` emit `decision-traces.jsonl`; the checker re-fetches
+skipped pools (Meteora + Birdeye 24h sustain) and scores miss-rate (sustained=missed vs
+collapsed=correct). Refreshed by a 6h cron + `bench:eval` section 8. Needs traces aged ≥2h.
 
 ---
 
