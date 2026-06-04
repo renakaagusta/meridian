@@ -87,52 +87,58 @@ async function main() {
       await sleep(150);
     }
 
-    if (!now && !be) { results.push({ pool, name: info.name, verdict: "gone", note: "delisted — correct skip" }); continue; }
+    if (!now && !be) { results.push({ pool, name: info.name, lp: "gone", spot: "gone", note: "delisted — correct skip" }); continue; }
 
     const feeNow = now ? num(now.fee_active_tvl_ratio) : 0;
     const volNow = now ? num(now.volume_window ?? now.volume) : 0;
-    // Meteora-pool sustain (fee + volume held vs entry snapshot)
-    const feeHeld = info.fee0 > 0 ? feeNow >= info.fee0 * 0.6 : feeNow >= 0.1;
+    // ── LP miss: did the METEORA POOL keep earning fees? (the only thing an LP cares about) ──
+    const feeHeld = info.fee0 > 0 ? feeNow >= info.fee0 * 0.6 : feeNow >= 0.3;
     const volHeld = info.vol0 > 0 ? volNow >= info.vol0 * 0.5 : volNow >= 1000;
-    const poolSustained = feeHeld && volHeld;
-    // Birdeye token sustain: still >$50k/24h volume and not down >40%.
-    const tokenSustained = be ? (be.vol24h >= 50_000 && be.price24h > -40) : false;
-    const sustained = poolSustained || tokenSustained;
-    results.push({
-      pool, name: info.name,
-      verdict: sustained ? "sustained(MISSED)" : "collapsed(correct)",
-      fee0: info.fee0, feeNow, vol0: info.vol0, volNow,
-      birdeye: be,
-    });
+    const lp = feeHeld && volHeld ? "missed" : "correct";
+    // ── Spot miss: did the TOKEN trade a CLEAN runner Hunter could've caught? ──
+    //   missed   = sustained volume + a tradeable up move (not a blow-off)
+    //   blowoff  = up >50% (Hunter correctly avoids buying the top) — NOT counted as missed
+    //   correct  = faded / illiquid
+    let spot = "correct";
+    if (be && be.vol24h >= 50_000) {
+      if (be.price24h > 50) spot = "blowoff";
+      else if (be.price24h >= 10) spot = "missed";
+    }
+    results.push({ pool, name: info.name, lp, spot, fee0: info.fee0, feeNow, vol0: info.vol0, volNow, birdeye: be });
   }
 
-  const judged = results.filter((r) => r.verdict !== "gone");
-  const missed = judged.filter((r) => r.verdict.startsWith("sustained"));
-  const correct = results.length - missed.length; // collapsed + gone = correct skips
-  const missRate = judged.length ? Math.round((missed.length / judged.length) * 100) : 0;
+  const judged = results.filter((r) => r.lp !== "gone");
+  const lpMissed = results.filter((r) => r.lp === "missed");
+  const spotMissed = results.filter((r) => r.spot === "missed");
+  const blowoff = results.filter((r) => r.spot === "blowoff");
+  const lpMissRate = judged.length ? Math.round((lpMissed.length / judged.length) * 100) : 0;
 
   const out = {
     generated_at: new Date().toISOString(),
     skipped_evaluated: results.length,
-    correct_skips: correct,
-    missed_opportunities: missed.length,
-    miss_rate_pct: missRate,
+    lp_missed: lpMissed.length,
+    lp_correct: results.length - lpMissed.length,
+    lp_miss_rate_pct: lpMissRate,
+    spot_missed: spotMissed.length,
+    blowoff_avoided: blowoff.length,
+    // back-compat: keep miss_rate_pct = the honest LP number
+    miss_rate_pct: lpMissRate,
     detail: results,
   };
   fs.mkdirSync(OUT_DIR, { recursive: true });
   fs.writeFileSync(path.join(OUT_DIR, `counterfactual-${new Date().toISOString().slice(0, 10)}.json`), JSON.stringify(out, null, 2));
 
+  const fmtVol = (v) => `$${Math.round(num(v)).toLocaleString("en-US")}`;
   console.log(`\n===== COUNTERFACTUAL: were our skips right? =====`);
   console.log(`Skipped pools evaluated: ${results.length}`);
-  console.log(`Correct skips (collapsed/gone): ${correct}`);
-  console.log(`Missed opportunities (sustained): ${missed.length}  →  miss rate ${missRate}%`);
-  if (missed.length) {
-    console.log("\nPools we skipped that kept earning (review why we rejected):");
-    for (const m of missed.slice(0, 10)) console.log(`  ${m.name?.slice(0, 16)} | fee ${m.fee0}→${m.feeNow} | vol ${m.vol0}→${m.volNow}`);
-  }
-  console.log(missRate > 40
-    ? "\n⚠️ High miss rate — the screener/challenger may be TOO strict for this market."
-    : "\n✅ Low miss rate — filters are mostly rejecting genuinely bad pools.");
+  console.log(`\nLP (did the pool keep earning fees?): ${lpMissed.length} missed → miss rate ${lpMissRate}%`);
+  for (const m of lpMissed.slice(0, 8)) console.log(`  MISSED ${m.name?.slice(0, 16)} | fee ${m.fee0}→${m.feeNow} | vol ${m.vol0}→${m.volNow}`);
+  console.log(`\nSpot (clean runner Hunter could've caught): ${spotMissed.length} missed · ${blowoff.length} blow-offs correctly avoided`);
+  for (const m of spotMissed.slice(0, 8)) console.log(`  MISSED ${m.name?.slice(0, 16)} | 24h ${m.birdeye?.price24h?.toFixed?.(1)}% vol ${fmtVol(m.birdeye?.vol24h)}`);
+  for (const m of blowoff.slice(0, 5)) console.log(`  blow-off ${m.name?.slice(0, 16)} | 24h +${m.birdeye?.price24h?.toFixed?.(0)}% vol ${fmtVol(m.birdeye?.vol24h)} (avoided)`);
+  console.log(lpMissRate > 40
+    ? "\n⚠️ High LP miss rate — screener may be too strict."
+    : "\n✅ Low LP miss rate — skipped pools genuinely drained.");
   console.log(`\nSaved → benchmark/counterfactual-${new Date().toISOString().slice(0, 10)}.json\n`);
 }
 
