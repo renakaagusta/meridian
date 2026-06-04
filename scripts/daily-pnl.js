@@ -268,6 +268,11 @@ function render(d) {
   lines.push(`| Win rate | ${pct(L.tod.win_rate)} | ${pct(L.cum.win_rate)} |`);
   lines.push(`| Profit factor | ${pf(L.tod.pf)} | ${pf(L.cum.pf)} |`);
   lines.push("");
+  lines.push("**LP by timeframe (realized):**");
+  lines.push("| Window | Realized | Closes (win%) | Fees |");
+  lines.push("|---|---|---|---|");
+  [["1d","d1"],["3d","d3"],["7d","d7"]].forEach(([lab,k])=>{const w=L.windows?.[k]||{pnl:0,count:0,win_rate:0,fees:0};lines.push(`| ${lab} | ${usd(w.pnl)} | ${w.count} (${pct(w.win_rate)}) | ${usd(w.fees||0)} |`);});
+  lines.push("");
   if (L.best && L.worst) {
     lines.push(`- Best: **${L.best.pool_name}** ${usd(L.best.pnl_usd)} (${pct(L.best.pnl_pct)}) · Worst: **${L.worst.pool_name}** ${usd(L.worst.pnl_usd)} (${pct(L.worst.pnl_pct)})`);
   }
@@ -288,6 +293,11 @@ function render(d) {
     if (T.post.orphan_recovered_sol > 0.0001) lines.push(`- ⚠️ ${T.post.orphan_recovered_sol.toFixed(4)} SOL from sells with no in-window buy (pre-reset positions; excluded from realized)`);
     if (T.post.open_bags && T.post.open_bags.length) lines.push(`- Open spot bags (cost-basis): ${T.post.open_bags.map((b) => `${b.token.slice(0,6)}… ${b.sol_cost.toFixed(4)} SOL`).join(" · ")}`); }
   lines.push(`- Today: ${T.post.today} swaps`);
+  lines.push("");
+  lines.push("**Trade by timeframe (cost-basis, since reset):**");
+  lines.push("| Window | Realized SOL | Round-trips |");
+  lines.push("|---|---|---|");
+  [["1d","d1"],["3d","d3"],["7d","d7"]].forEach(([lab,k])=>{const w=T.windows?.[k]||{net:0,n:0};lines.push(`| ${lab} | ${w.net>=0?"+":""}${n(w.net).toFixed(4)} | ${w.n} |`);});
   if (W.tokens?.length) lines.push(`- Open spot holdings: ${W.tokens.map((t) => `${t.symbol} (${t.usd != null ? usd(t.usd) : t.balance})`).join(" · ")}`);
   lines.push("");
   // Missed opps
