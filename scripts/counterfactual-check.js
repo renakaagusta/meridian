@@ -34,26 +34,27 @@ const MIN_AGE_H = opt("--minAgeH", 2);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
-function recentScreeningTraces() {
+function readTraces() {
   if (!fs.existsSync(TRACES)) return [];
   const lines = fs.readFileSync(TRACES, "utf8").split("\n").filter(Boolean);
-  return lines.map((l) => { try { return JSON.parse(l); } catch { return null; } })
-    .filter((t) => t && t.cycle === "screening" && Array.isArray(t.inputs?.candidates))
-    .slice(-CYCLES);
+  return lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 }
 
 async function main() {
-  const traces = recentScreeningTraces();
+  const all = readTraces();
+  const traces = all.filter((t) => t.cycle === "screening" && Array.isArray(t.inputs?.candidates)).slice(-CYCLES);
+  // Pools we actually entered — never count these as "skipped".
+  const deployedPools = new Set(all.filter((t) => t.cycle === "deploy" && t.decision?.pool).map((t) => t.decision.pool));
+
   // Collect skipped candidates (considered but not deployed), old enough to judge.
   const cutoff = Date.now() - MIN_AGE_H * 3600_000;
-  const skipped = new Map(); // pool -> { name, ts, fee0, vol0, deployed_elsewhere }
+  const skipped = new Map(); // pool -> { name, base_mint, ts, fee0, vol0 }
   for (const t of traces) {
     if (new Date(t.ts).getTime() > cutoff) continue; // too fresh to judge outcome
-    const deployedPool = t.decision?.pool;
     for (const c of t.inputs.candidates) {
-      if (!c.pool || c.pool === deployedPool) continue;
+      if (!c.pool || deployedPools.has(c.pool)) continue;
       if (!skipped.has(c.pool)) {
-        skipped.set(c.pool, { name: c.name, ts: t.ts, fee0: num(c.fee_active_tvl_ratio), vol0: num(c.volume_window) });
+        skipped.set(c.pool, { name: c.name, base_mint: c.base_mint || null, ts: t.ts, fee0: num(c.fee_active_tvl_ratio), vol0: num(c.volume_window) });
       }
     }
   }
@@ -64,19 +65,45 @@ async function main() {
   }
 
   console.log(`[counterfactual] re-checking ${skipped.size} skipped pools...`);
+  const { getBirdeyeVelocity } = await import("../tools/birdeye.js");
   const results = [];
   for (const [pool, info] of skipped) {
     let now = null;
     try { now = await getPoolDetail({ pool_address: pool }); } catch { /* delisted / gone */ }
     await sleep(150);
-    if (!now) { results.push({ pool, name: info.name, verdict: "gone", note: "delisted — correct skip" }); continue; }
-    const feeNow = num(now.fee_active_tvl_ratio);
-    const volNow = num(now.volume_window ?? now.volume);
-    // SUSTAINED = kept generating fees (we likely missed it). COLLAPSED = we were right.
+
+    // Birdeye token-level cross-check: did the TOKEN keep trading (24h volume +
+    // not price-collapsed)? Catches missed runners even when the specific Meteora
+    // pool drained (LPs rotate pools; the token can still be a fee opportunity).
+    let be = null;
+    if (info.base_mint) {
+      try {
+        const v = await getBirdeyeVelocity({ mint: info.base_mint });
+        if (v?.found) {
+          const d = v.velocity?.["24h"] || {};
+          be = { vol24h: num(d.volume_usd), price24h: num(d.price_change_pct), holders: num(v.holder_count) };
+        }
+      } catch { /* scraper/CF hiccup — fall back to Meteora-only */ }
+      await sleep(150);
+    }
+
+    if (!now && !be) { results.push({ pool, name: info.name, verdict: "gone", note: "delisted — correct skip" }); continue; }
+
+    const feeNow = now ? num(now.fee_active_tvl_ratio) : 0;
+    const volNow = now ? num(now.volume_window ?? now.volume) : 0;
+    // Meteora-pool sustain (fee + volume held vs entry snapshot)
     const feeHeld = info.fee0 > 0 ? feeNow >= info.fee0 * 0.6 : feeNow >= 0.1;
     const volHeld = info.vol0 > 0 ? volNow >= info.vol0 * 0.5 : volNow >= 1000;
-    const sustained = feeHeld && volHeld;
-    results.push({ pool, name: info.name, verdict: sustained ? "sustained(MISSED)" : "collapsed(correct)", fee0: info.fee0, feeNow, vol0: info.vol0, volNow });
+    const poolSustained = feeHeld && volHeld;
+    // Birdeye token sustain: still >$50k/24h volume and not down >40%.
+    const tokenSustained = be ? (be.vol24h >= 50_000 && be.price24h > -40) : false;
+    const sustained = poolSustained || tokenSustained;
+    results.push({
+      pool, name: info.name,
+      verdict: sustained ? "sustained(MISSED)" : "collapsed(correct)",
+      fee0: info.fee0, feeNow, vol0: info.vol0, volNow,
+      birdeye: be,
+    });
   }
 
   const judged = results.filter((r) => r.verdict !== "gone");
