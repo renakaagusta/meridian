@@ -159,9 +159,11 @@ function missedOpps() {
   return {
     file: files[files.length - 1],
     generated_at: cf.generated_at,
-    miss_rate: cf.miss_rate_pct,
+    lp_miss_rate: cf.lp_miss_rate_pct ?? cf.miss_rate_pct,
     evaluated: cf.skipped_evaluated,
-    missed: (cf.detail || []).filter((d) => (d.verdict || "").startsWith("sustained")),
+    lp_missed: (cf.detail || []).filter((d) => d.lp === "missed"),
+    spot_missed: (cf.detail || []).filter((d) => d.spot === "missed"),
+    blowoff: (cf.detail || []).filter((d) => d.spot === "blowoff"),
   };
 }
 
@@ -266,12 +268,13 @@ function render(d) {
   // Missed opps
   lines.push("## 🕳️ Missed opportunities (counterfactual)");
   if (M) {
-    lines.push(`- Skip miss-rate: **${M.miss_rate}%** of ${M.evaluated} evaluated (from \`${M.file}\`, ${(M.generated_at || "").slice(0, 16)})`);
-    if (M.missed.length) {
-      lines.push(`- Skipped pools that kept earning:`);
-      for (const m of M.missed.slice(0, 8)) lines.push(`  - **${m.name}** — fee ${n(m.fee0).toFixed(2)}→${n(m.feeNow).toFixed(2)}${m.birdeye ? ` · birdeye 24h vol ${usd(m.birdeye.vol24h)} / ${pct(m.birdeye.price24h)}` : ""}`);
-    } else lines.push(`- No sustained skips — filters rejected genuinely bad pools.`);
-    lines.push(`- _Note: "sustained" = token kept trading; ignores IL risk, so this overstates LP-relevant misses._`);
+    lines.push(`- **LP miss-rate: ${M.lp_miss_rate}%** of ${M.evaluated} skipped pools (pool kept earning fees) — \`${M.file}\` ${(M.generated_at || "").slice(0, 16)}`);
+    if (M.lp_missed.length) {
+      for (const m of M.lp_missed.slice(0, 6)) lines.push(`  - LP MISS **${m.name}** — fee ${n(m.fee0).toFixed(2)}→${n(m.feeNow).toFixed(2)} · vol ${usd(m.vol0)}→${usd(m.volNow)}`);
+    } else lines.push(`  - No LP misses — every skipped pool drained (correct skips).`);
+    lines.push(`- **Spot: ${M.spot_missed.length} clean runner(s) missed · ${M.blowoff.length} blow-off(s) correctly avoided**`);
+    for (const m of M.spot_missed.slice(0, 6)) lines.push(`  - SPOT MISS **${m.name}** — 24h ${pct(m.birdeye?.price24h)} · vol ${usd(m.birdeye?.vol24h)}`);
+    for (const m of M.blowoff.slice(0, 4)) lines.push(`  - blow-off avoided: ${m.name} (24h +${n(m.birdeye?.price24h).toFixed(0)}%, vol ${usd(m.birdeye?.vol24h)})`);
   } else lines.push(`- No counterfactual report yet (run \`node scripts/counterfactual-check.js --minAgeH 2\`).`);
   lines.push("");
   // Health
