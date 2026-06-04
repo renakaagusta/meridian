@@ -63,19 +63,27 @@ function lpStack() {
   // exit reasons
   const byReason = {};
   for (const r of L) { const k = (r.close_reason || "?").slice(0, 30); (byReason[k] ??= { n: 0, pnl: 0 }); byReason[k].n++; byReason[k].pnl += n(r.pnl_usd); }
-  return { cum, tod, worst, best, byReason };
+  // rolling windows
+  const win = (days) => agg(L.filter((r) => Date.now() - new Date(r.recorded_at).getTime() <= days * 86400_000));
+  const windows = { d1: win(1), d3: win(3), d7: win(7) };
+  return { cum, tod, worst, best, byReason, windows, agg };
 }
 
 // ───────────────────────── Trade stack ─────────────────────────
 // chat.db lives in Evonic (python-written sqlite). Read it via python3 — always
 // present on the host — instead of node:sqlite (version/flag-dependent).
 const PY_TRADE = `
-import sqlite3, json, sys
+import sqlite3, json, sys, datetime
 RESET_TS, DATE = sys.argv[1], sys.argv[2]
 dbs = sys.argv[3:]
 SOL = {"So11111111111111111111111111111111111111112","So11111111111111111111111111111111111111111"}
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+now = datetime.datetime.now(datetime.timezone.utc)
+def age_days(ts):
+    try: return (now - datetime.datetime.fromisoformat(ts.replace(" ","T")+("+00:00" if "+" not in ts and "Z" not in ts else "").replace("Z","+00:00"))).total_seconds()/86400
+    except Exception: return 1e9
 sb=ss=us=buys=sells=today=0
+win={ "d1":{"net":0.0,"n":0}, "d3":{"net":0.0,"n":0}, "d7":{"net":0.0,"n":0} }
 for db in dbs:
     try: con=sqlite3.connect(db)
     except Exception: continue
@@ -94,15 +102,19 @@ for db in dbs:
             except Exception: continue
             if not d.get("success"): continue
             ai,ao=int(d["amount_in"]),int(d["amount_out"])
-            if d["input_mint"] in SOL: sb+=ai/1e9; buys+=1
-            elif d["output_mint"] in SOL: ss+=ao/1e9; sells+=1
-            elif d["output_mint"]==USDC: us+=ao/1e6; sells+=1
+            flow=0.0
+            if d["input_mint"] in SOL: sb+=ai/1e9; buys+=1; flow=-ai/1e9
+            elif d["output_mint"] in SOL: ss+=ao/1e9; sells+=1; flow=ao/1e9
+            elif d["output_mint"]==USDC: us+=ao/1e6; sells+=1; flow=(ao/1e6)/75
             if ts[:10]==DATE: today+=1
-print(json.dumps({"spent_sol":sb,"recovered_sol":ss,"recovered_usdc":us,"buys":buys,"sells":sells,"today":today}))
+            a=age_days(ts)
+            for k,dd in (("d1",1),("d3",3),("d7",7)):
+                if a<=dd: win[k]["net"]+=flow; win[k]["n"]+=1
+print(json.dumps({"spent_sol":sb,"recovered_sol":ss,"recovered_usdc":us,"buys":buys,"sells":sells,"today":today,"windows":win}))
 `;
 function tradeStack() {
   const dbs = ["meridian_trader_screener", "meridian_trader_manager"].map((a) => path.join(EVONIC_DIR, "agents", a, "chat.db"));
-  let post = { spent_sol: 0, recovered_sol: 0, recovered_usdc: 0, buys: 0, sells: 0, today: 0 };
+  let post = { spent_sol: 0, recovered_sol: 0, recovered_usdc: 0, buys: 0, sells: 0, today: 0, windows: { d1: { net: 0, n: 0 }, d3: { net: 0, n: 0 }, d7: { net: 0, n: 0 } } };
   try {
     const out = execFileSync("python3", ["-c", PY_TRADE, RESET_TS, DATE, ...dbs], { encoding: "utf8", timeout: 20000 });
     post = JSON.parse(out.trim());
@@ -111,6 +123,7 @@ function tradeStack() {
   return {
     baseline: TRADE_BASELINE,
     post: { ...post, net_sol: postNet },
+    windows: post.windows,
     cum_net_sol: TRADE_BASELINE.net_sol + postNet,
     cum_buys: TRADE_BASELINE.buys + post.buys,
     cum_sells: TRADE_BASELINE.sells + post.sells,
@@ -169,6 +182,23 @@ function health() {
   return { traces, hunter, errors24h };
 }
 
+// ───────────────────────── Wallet Δ over periods (from HISTORY) ─────────────────────────
+function walletDeltas(currentUsd) {
+  const prev = safe(() => fs.readFileSync(path.join(OUT_DIR, "HISTORY.md"), "utf8"), "") || "";
+  const hist = {};
+  for (const l of prev.split("\n")) {
+    const m = l.match(/^\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*\$?([\d,.\-]+)/);
+    if (m) hist[m[1]] = parseFloat(m[2].replace(/,/g, ""));
+  }
+  const base = new Date(DATE + "T00:00:00Z").getTime();
+  const out = {};
+  for (const days of [1, 3, 7]) {
+    const target = new Date(base - days * 86400_000).toISOString().slice(0, 10);
+    out[`d${days}`] = currentUsd != null && Number.isFinite(hist[target]) ? currentUsd - hist[target] : null;
+  }
+  return out;
+}
+
 // ───────────────────────── Render ─────────────────────────
 function render(d) {
   const L = d.lp, T = d.trade, W = d.wallet, O = d.open, M = d.missed, H = d.health;
@@ -186,6 +216,23 @@ function render(d) {
   lines.push(`- **Trade realized (cumulative):** ${T.cum_net_sol >= 0 ? "+" : ""}${T.cum_net_sol.toFixed(4)} SOL over ${T.cum_buys} buys / ${T.cum_sells} sells`);
   lines.push(`- **Open positions:** ${O.count} LP (${usd(O.unreal)} unrealized)${W.tokens?.length ? ` · ${W.tokens.length} spot holding(s)` : ""}`);
   lines.push(`- **Today:** ${L.tod.count} LP closes (${usd(L.tod.pnl)}) · ${T.post.today} trade swaps`);
+  lines.push("");
+  // Period performance (rolling realized + wallet Δ)
+  lines.push("## ⏱️ Period performance (realized)");
+  lines.push(`| Window | LP realized | LP closes (win%) | Trade net SOL (swaps) | Wallet Δ |`);
+  lines.push(`|---|---|---|---|---|`);
+  const WD = d.walletDeltas || {};
+  const rowFor = (key, label) => {
+    const lp = L.windows?.[key] || { pnl: 0, count: 0, win_rate: 0 };
+    const tw = T.windows?.[key] || { net: 0, n: 0 };
+    const wd = WD[key];
+    return `| ${label} | ${usd(lp.pnl)} | ${lp.count} (${pct(lp.win_rate)}) | ${tw.net >= 0 ? "+" : ""}${n(tw.net).toFixed(4)} (${tw.n}) | ${wd == null ? "n/a" : usd(wd)} |`;
+  };
+  lines.push(rowFor("d1", "1d"));
+  lines.push(rowFor("d3", "3d"));
+  lines.push(rowFor("d7", "7d"));
+  lines.push(`| All | ${usd(L.cum.pnl)} | ${L.cum.count} (${pct(L.cum.win_rate)}) | ${T.cum_net_sol >= 0 ? "+" : ""}${T.cum_net_sol.toFixed(4)} (${T.cum_buys + T.cum_sells}) | — |`);
+  lines.push(`_Wallet Δ needs ≥2 daily snapshots N days apart (HISTORY.md); fills in as reports accumulate. Trade net = SOL flow in window (approx; ignores cross-window round-trips)._`);
   lines.push("");
   // LP
   lines.push("## 💧 LP stack (Scout)");
@@ -267,6 +314,7 @@ async function main() {
     missed: safe(missedOpps, null),
     health: safe(health, { traces: 0, hunter: 0, errors24h: 0 }),
   };
+  d.walletDeltas = walletDeltas(d.wallet?.error ? null : d.wallet.total_usd);
   const md = render(d);
   const outFile = path.join(OUT_DIR, `${DATE}.md`);
   fs.writeFileSync(outFile, md);
