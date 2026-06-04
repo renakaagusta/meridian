@@ -35,19 +35,23 @@ function withTimeout(promise, ms) {
 
 /**
  * Fetch any Birdeye forge path through the scraper proxy. Returns the parsed
- * Birdeye response body (the proxy's `json`), or null on any failure. `ttl`
- * (seconds) controls the scraper-side Redis cache; omit for the default.
+ * Birdeye response body (the proxy's `json`), or null on any failure.
+ *
+ * ALWAYS uncached (`ttl: 0`): trade/LP decisions must act on fresh data — the
+ * scraper's Redis cache (incl. its 60s negative cache) was serving stale/empty
+ * results and poisoning the candidate feed after a single transient failure.
+ * `timeoutMs` is per-call (hot-path velocity stays tight; discovery gets longer).
  */
-async function birdeyeForge(path, { method = "GET", body, ttl } = {}) {
+async function birdeyeForge(path, { method = "GET", body, timeoutMs = FETCH_TIMEOUT_MS } = {}) {
   if (!SCRAPER_SECRET) return null; // feature not provisioned — quiet no-op
   try {
     const res = await withTimeout(
       fetch(`${SCRAPER_URL}/scrape/birdeye/forge`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${SCRAPER_SECRET}` },
-        body: JSON.stringify({ path, method, body, ttl }),
+        body: JSON.stringify({ path, method, body, ttl: 0 }),
       }),
-      FETCH_TIMEOUT_MS,
+      timeoutMs,
     );
     if (!res.ok) {
       logErr("forge_http", `${res.status} for ${path}`);
@@ -185,6 +189,7 @@ const GEM_DEFAULTS = {
   offset: 0,
   limit: 50,
   shown_time_frame: "24h",
+  filters: [], // required by Birdeye since 2026-06 — omitting it returns 400 "filters invalid format"
 };
 
 function shapeGem(raw) {
@@ -211,10 +216,37 @@ function shapeGem(raw) {
   };
 }
 
+/**
+ * Momentum-tuned SPOT candidate list (Hunter's primary source). Sources the
+ * keyless Birdeye trending gems, sorts by 1h price momentum, and filters:
+ *   - 1h price change in [min_change, max_change] (positive momentum, reject blow-off)
+ *   - liquidity >= min_tvl  (thin pools = slippage traps)
+ *   - 24h volume >= min_volume
+ * Hunter still does per-candidate 5m deep-research (get_dex_velocity → true 5m).
+ */
+export async function getMomentumCandidates({ limit = 5, min_change = 3, max_change = 80, min_tvl = 20000, min_volume = 0, chain = "solana" } = {}) {
+  const gems = await getBirdeyeGems({ chain, limit: 50, sort_by: "tf1h.priceChangePercent", sort_type: "desc" });
+  if (!gems.items?.length) return { source: "birdeye-momentum", count: 0, candidates: [], note: gems.error || "no gems data" };
+  const candidates = gems.items.filter((c) => {
+    const ch = c.velocity?.["1h"]?.price_change_pct;
+    const vol = c.velocity?.["24h"]?.volume_usd ?? 0;
+    return typeof ch === "number" && ch >= min_change && ch <= max_change
+      && (c.liquidity_usd ?? 0) >= min_tvl && vol >= min_volume;
+  }).slice(0, limit);
+  return {
+    source: "birdeye-momentum",
+    filters: { min_change, max_change, min_tvl, min_volume },
+    screened: gems.items.length,
+    count: candidates.length,
+    candidates,
+  };
+}
+
 /** Trending candidate list with per-window velocity + holder data. */
 export async function getBirdeyeGems(opts = {}) {
   const payload = { ...GEM_DEFAULTS, ...opts };
-  const resp = await birdeyeForge("/forge/multichain/v3/gems", { method: "POST", body: payload });
+  // Discovery call (not hot-path): allow a cold warm-up since it's uncached.
+  const resp = await birdeyeForge("/forge/multichain/v3/gems", { method: "POST", body: payload, timeoutMs: 90000 });
   const items = resp?.data?.items;
   if (!Array.isArray(items)) {
     return { source: "birdeye-gems", error: "no data", count: 0, items: [] };
