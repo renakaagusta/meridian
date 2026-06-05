@@ -83,6 +83,7 @@ async function tradeStack(walletObj) {
     return await computeTradeStack({
       wallet,
       poolMemoryPath: path.join(ROOT, "pool-memory.json"),
+      lessonsPath: path.join(ROOT, "lessons.json"),
       cachePath: path.join(OUT_DIR, ".tx-cache.json"),
       solPrice: Number(walletObj?.sol_price) || 0,
     });

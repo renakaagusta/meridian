@@ -34,7 +34,7 @@ function buildEndpoints() {
   return cand.length ? cand : ["https://api.mainnet-beta.solana.com"];
 }
 
-export async function computeTradeStack({ wallet, poolMemoryPath, cachePath, solPrice = 0, now } = {}) {
+export async function computeTradeStack({ wallet, poolMemoryPath, lessonsPath, cachePath, solPrice = 0, now } = {}) {
   let W = wallet || process.env.WALLET_PUBKEY;
   if (!W && process.env.WALLET_PRIVATE_KEY) {
     const { Keypair } = await import("@solana/web3.js");
@@ -84,9 +84,12 @@ export async function computeTradeStack({ wallet, poolMemoryPath, cachePath, sol
   }
   if (cachePath) { try { fs.writeFileSync(cachePath, JSON.stringify(cache)); } catch {} }
 
-  // LP base mints (from pool-memory.json) — excluded from trade
+  // LP base mints — union of the permanent close ledger (lessons.json, the same
+  // source the LP stack uses) and the deploy-history (pool-memory.json, which can
+  // prune/cooldown). Any swap of these mints is LP-stack economics, never a trade.
   const LP = new Set();
   try { const pm = JSON.parse(fs.readFileSync(poolMemoryPath, "utf8")); for (const k in pm) if (pm[k]?.base_mint) LP.add(pm[k].base_mint); } catch {}
+  try { const ls = JSON.parse(fs.readFileSync(lessonsPath, "utf8")); for (const p of (ls.performance || [])) if (p?.base_mint) LP.add(p.base_mint); } catch {}
 
   // parse each tx into a single SOL<->token swap leg
   const parse = (tx) => {
