@@ -62,3 +62,4 @@ overnight_*.md
 user-config.json
 user-config.json.*
 reports/
+benchmark/rejected-pools.jsonl

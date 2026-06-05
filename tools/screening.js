@@ -1,3 +1,6 @@
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
@@ -5,6 +8,41 @@ import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+
+// ── Pre-filter rejection log (issue #35) ────────────────────────────────────
+// Pools rejected by the hard filters never reach the LLM or decision-traces, so
+// the counterfactual was blind to them. Append each reject (with gradeable
+// metrics) here; counterfactual-check.js re-checks whether they went on to
+// sustain fees / run — i.e. whether the filters are too strict.
+const _SCREEN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const REJECT_LOG = path.join(_SCREEN_ROOT, "benchmark", "rejected-pools.jsonl");
+let _rejectTrimmed = false;
+function recordRejection(pool, reason) {
+  try {
+    fs.mkdirSync(path.dirname(REJECT_LOG), { recursive: true });
+    // Opportunistic trim once per process if the log has grown large (keep tail).
+    if (!_rejectTrimmed) {
+      _rejectTrimmed = true;
+      try {
+        if (fs.existsSync(REJECT_LOG) && fs.statSync(REJECT_LOG).size > 2_000_000) {
+          const tail = fs.readFileSync(REJECT_LOG, "utf8").split("\n").filter(Boolean).slice(-4000);
+          fs.writeFileSync(REJECT_LOG, tail.join("\n") + "\n");
+        }
+      } catch { /* trim best-effort */ }
+    }
+    const rec = {
+      ts: new Date().toISOString(),
+      pool: pool?.pool_address || null,
+      name: pool?.name || null,
+      base_mint: getPoolBaseMint(pool),
+      reason,
+      fee_active_tvl_ratio: numeric(pool?.fee_active_tvl_ratio),
+      volume_window: numeric(pool?.volume_window ?? pool?.volume),
+      tvl: numeric(pool?.tvl ?? pool?.active_tvl),
+    };
+    if (rec.pool) fs.appendFileSync(REJECT_LOG, JSON.stringify(rec) + "\n");
+  } catch { /* logging must never break screening */ }
+}
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -504,6 +542,7 @@ export async function discoverPools({
     const reason = getRawPoolScreeningRejectReason(pool, s);
     if (!reason) return true;
     filteredExamples.push({ name: pool.name || pool.pool_address || "unknown pool", reason });
+    recordRejection(pool, reason); // issue #35 — grade-able pre-filter rejection log
     if (pool.discord_signal) log("screening", `Discord signal filtered: ${pool.name || pool.pool_address} — ${reason}`);
     return false;
   });
