@@ -9,9 +9,9 @@
  * Sources:
  *   LP realized   → lessons.json (closed-position performance records)
  *   LP open       → getMyPositions() (mark-to-market unrealized)
- *   Trade realized→ trader-agent swap logs (Evonic chat.db) + a fixed pre-reset
- *                   baseline (Hunter's pre-2026-06-04 buy history was cleared
- *                   during the context-overflow fix; preserved here as a const)
+ *   Trade realized→ on-chain swap reconstruction (FIFO cost-basis in SOL,
+ *                   spot-only; LP-base + stablecoin swaps excluded). Full
+ *                   history; see scripts/trade-onchain.mjs
  *   Wallet        → getWalletBalances() (SOL + holdings, ground-truth net worth)
  *   Missed opps   → latest benchmark/counterfactual-*.json
  *   Health        → decision-traces.jsonl, Evonic agent dbs + logs
@@ -32,9 +32,6 @@ const args = process.argv.slice(2);
 const flag = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : null; };
 const DATE = flag("--date") || new Date().toISOString().slice(0, 10);
 
-// Pre-reset trade baseline (swap-logged, from the 2026-06-04 reconstruction).
-const TRADE_BASELINE = { net_sol: -0.2995, buys: 8, sells: 7, note: "pre-2026-06-04 reset (buys recovered from backup)" };
-const RESET_TS = "2026-06-04T01:44:00Z"; // post-cutoff live swaps are added to the baseline
 
 const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const usd = (v) => `$${n(v).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
@@ -69,87 +66,27 @@ function lpStack() {
   return { cum, tod, worst, best, byReason, windows, agg };
 }
 
-// ───────────────────────── Trade stack ─────────────────────────
-// chat.db lives in Evonic (python-written sqlite). Read it via python3 — always
-// present on the host — instead of node:sqlite (version/flag-dependent).
-const PY_TRADE = `
-import sqlite3, json, sys, datetime
-RESET_TS, DATE, SOLPRICE = sys.argv[1], sys.argv[2], float(sys.argv[3])
-dbs = sys.argv[4:]
-SOL = {"So11111111111111111111111111111111111111112","So11111111111111111111111111111111111111111"}
-USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-now = datetime.datetime.now(datetime.timezone.utc)
-def age_days(ts):
-    try: return (now - datetime.datetime.fromisoformat(ts.replace(" ","T")+("+00:00" if "+" not in ts and "Z" not in ts else "").replace("Z","+00:00"))).total_seconds()/86400
-    except Exception: return 1e9
-# Collect post-reset successful swaps from the TRADE agents only, as quantity-aware events.
-events=[]
-for db in dbs:
-    try: con=sqlite3.connect(db); rows=con.execute("SELECT content,tool_calls,tool_call_id,created_at FROM chat_messages ORDER BY id").fetchall()
-    except Exception: continue
-    cm=set()
-    for content,tc,tcid,ts in rows:
-        if tc:
-            try: arr=json.loads(tc)
-            except Exception: arr=[]
-            for c in (arr if isinstance(arr,list) else []):
-                if c.get("id") and (c.get("function") or {}).get("name")=="swap_token": cm.add(c["id"])
-    for content,tc,tcid,ts in rows:
-        t=ts.replace(" ","T") if ts else ts
-        if tcid in cm and content and t and t>RESET_TS:
-            try: d=json.loads(content)["data"]
-            except Exception: continue
-            if not d.get("success"): continue
-            try: ai,ao=int(d["amount_in"]),int(d["amount_out"])
-            except Exception: continue
-            im,om=d.get("input_mint"),d.get("output_mint")
-            if im in SOL:    events.append((t,"buy", om, float(ao), ai/1e9))            # qty=token out, cost=sol in
-            elif om in SOL:  events.append((t,"sell",im, float(ai), ao/1e9))            # qty=token in, recv=sol out
-            elif om==USDC:   events.append((t,"sell",im, float(ai), (ao/1e6)/SOLPRICE)) # usdc->sol approx
-events.sort(key=lambda e:e[0])
-# FIFO cost-basis per token (by quantity). Realized only on the bought-in-window portion.
-lots={}  # token -> list of [qty, sol_cost]
-realized=0.0; buys=sells=closed=wins=today=0; orphan=0.0
-win={"d1":{"net":0.0,"n":0},"d3":{"net":0.0,"n":0},"d7":{"net":0.0,"n":0}}
-for t,side,token,qty,sol in events:
-    if t[:10]==DATE: today+=1
-    if side=="buy":
-        buys+=1; lots.setdefault(token,[]).append([qty, sol])
-    else:
-        sells+=1; need=qty; cost=0.0; L=lots.get(token,[])
-        while need>1e-9 and L:
-            lq,lc=L[0]; take=min(lq,need); cost+=lc*(take/lq) if lq>0 else 0.0
-            lq-=take; need-=take
-            if lq<=1e-9: L.pop(0)
-            else: L[0]=[lq, lc*(lq/(lq+take)) if (lq+take)>0 else 0.0]
-        matched=(qty-need)/qty if qty>0 else 0.0
-        r=sol*matched - cost
-        if need>1e-9: orphan += sol*(need/qty if qty>0 else 0.0)
-        realized+=r; closed+=1
-        if r>0: wins+=1
-        a=age_days(t)
-        for k,dd in (("d1",1),("d3",3),("d7",7)):
-            if a<=dd: win[k]["net"]+=r; win[k]["n"]+=1
-open_bags=[{"token":tk,"qty":q,"sol_cost":round(c,6)} for tk,ls in lots.items() for q,c in ls if q>1e-9]
-print(json.dumps({"realized_sol":round(realized,6),"buys":buys,"sells":sells,"closed":closed,"wins":wins,
-                  "orphan_recovered_sol":round(orphan,6),"open_bags":open_bags,"today":today,"windows":win}))
-`;
-function tradeStack() {
-  const dbs = ["meridian_trader_screener", "meridian_trader_manager"].map((a) => path.join(EVONIC_DIR, "agents", a, "chat.db"));
-  let post = { realized_sol: 0, buys: 0, sells: 0, closed: 0, wins: 0, orphan_recovered_sol: 0, open_bags: [], today: 0, windows: { d1: { net: 0, n: 0 }, d3: { net: 0, n: 0 }, d7: { net: 0, n: 0 } } };
-  try {
-    const out = execFileSync("python3", ["-c", PY_TRADE, RESET_TS, DATE, "70", ...dbs], { encoding: "utf8", timeout: 20000 });
-    post = JSON.parse(out.trim());
-  } catch { /* python/db unavailable — baseline only */ }
-  const postNet = post.realized_sol || 0;
-  return {
-    baseline: TRADE_BASELINE,
-    post: { ...post, net_sol: postNet },
-    windows: post.windows,
-    cum_net_sol: TRADE_BASELINE.net_sol + postNet,
-    cum_buys: TRADE_BASELINE.buys + post.buys,
-    cum_sells: TRADE_BASELINE.sells + post.sells,
+// ───────────────────────── Trade stack (on-chain) ─────────────────────────
+// Full-history FIFO cost-basis from the chain (spot only; LP-base + stablecoin
+// swaps excluded). See scripts/trade-onchain.mjs.
+async function tradeStack(walletObj) {
+  const empty = {
+    source: "none", cum_net_sol: 0, cum_buys: 0, cum_sells: 0,
+    windows: { d1: { net: 0, n: 0 }, d3: { net: 0, n: 0 }, d7: { net: 0, n: 0 } },
+    post: { realized_sol: 0, buys: 0, sells: 0, closed: 0, wins: 0, today: 0, orphan_recovered_sol: 0, open_bags: [] },
+    info: { stable_sol: 0, lp_cleanup_sol: 0, swaps: 0, txs: 0, oldest: null },
   };
+  try {
+    const { computeTradeStack } = await import("./trade-onchain.mjs");
+    let wallet = process.env.WALLET_PUBKEY;
+    if (!wallet) { try { const wmod = await import("../tools/wallet.js"); wallet = wmod.getWallet().publicKey.toString(); } catch {} }
+    return await computeTradeStack({
+      wallet,
+      poolMemoryPath: path.join(ROOT, "pool-memory.json"),
+      cachePath: path.join(OUT_DIR, ".tx-cache.json"),
+      solPrice: Number(walletObj?.sol_price) || 0,
+    });
+  } catch (e) { empty.error = e.message; return empty; }
 }
 
 // ───────────────────────── Wallet (ground truth) ─────────────────────────
@@ -287,17 +224,17 @@ function render(d) {
   // Trade
   lines.push("## 📈 Trade stack (Hunter→Skeptic→Hands)");
   lines.push(`- **Cumulative realized:** ${T.cum_net_sol >= 0 ? "+" : ""}${T.cum_net_sol.toFixed(4)} SOL (${T.cum_buys} buys / ${T.cum_sells} sells)`);
-  lines.push(`- Baseline (pre-reset): ${T.baseline.net_sol} SOL · ${T.baseline.note}`);
   { const wp = T.post.closed ? Math.round(100 * T.post.wins / T.post.closed) : 0;
-    lines.push(`- Since reset (cost-basis): ${T.post.realized_sol >= 0 ? "+" : ""}${(T.post.realized_sol || 0).toFixed(4)} SOL realized over ${T.post.closed} round-trip(s) · ${T.post.buys} buys / ${T.post.sells} sells · ${wp}% win`);
+    lines.push(`- Win rate: ${wp}% over ${T.post.closed} round-trip(s) · source: ${T.source || "on-chain"}${T.info?.oldest ? ` (history since ${T.info.oldest})` : ""}`);
     if (T.post.orphan_recovered_sol > 0.0001) lines.push(`- ⚠️ ${T.post.orphan_recovered_sol.toFixed(4)} SOL from sells with no in-window buy (pre-reset positions; excluded from realized)`);
     if (T.post.open_bags && T.post.open_bags.length) lines.push(`- Open spot bags (cost-basis): ${T.post.open_bags.map((b) => `${b.token.slice(0,6)}… ${b.sol_cost.toFixed(4)} SOL`).join(" · ")}`); }
   lines.push(`- Today: ${T.post.today} swaps`);
   lines.push("");
-  lines.push("**Trade by timeframe (cost-basis, since reset):**");
+  lines.push("**Trade by timeframe (on-chain cost-basis, full history):**");
   lines.push("| Window | Realized SOL | Round-trips |");
   lines.push("|---|---|---|");
   [["1d","d1"],["3d","d3"],["7d","d7"]].forEach(([lab,k])=>{const w=T.windows?.[k]||{net:0,n:0};lines.push(`| ${lab} | ${w.net>=0?"+":""}${n(w.net).toFixed(4)} | ${w.n} |`);});
+  if (T.info && (T.info.lp_cleanup_sol || T.info.stable_sol)) lines.push(`- _Spot only — excludes ${T.info.lp_cleanup_sol.toFixed(3)} SOL LP-base cleanup (LP-stack economics) + ${T.info.stable_sol.toFixed(3)} SOL stablecoin moves_`);
   if (W.tokens?.length) lines.push(`- Open spot holdings: ${W.tokens.map((t) => `${t.symbol} (${t.usd != null ? usd(t.usd) : t.balance})`).join(" · ")}`);
   lines.push("");
   // Missed opps
@@ -344,10 +281,11 @@ function upsertHistory(d) {
 
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
+  const wallet = await walletState();
   const d = {
     lp: safe(lpStack, { cum: {}, tod: {}, byReason: {} }),
-    trade: safe(tradeStack, { baseline: TRADE_BASELINE, post: {}, cum_net_sol: TRADE_BASELINE.net_sol, cum_buys: 8, cum_sells: 7 }),
-    wallet: await walletState(),
+    trade: await tradeStack(wallet),
+    wallet,
     open: await openPositions(),
     missed: safe(missedOpps, null),
     health: safe(health, { traces: 0, hunter: 0, errors24h: 0 }),
