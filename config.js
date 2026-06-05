@@ -134,7 +134,7 @@ export const config = {
     // Default OFF — untested on-chain; enable + watch the first one before trusting it.
     recenterEnabled:       u.recenterEnabled       ?? false,
     maxRecentersPerPosition: u.maxRecentersPerPosition ?? 3,
-    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
+    stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -12,
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close

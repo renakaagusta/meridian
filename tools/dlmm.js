@@ -1325,6 +1325,9 @@ export async function getMyPositions({ force = false, silent = false, wallet_add
           pnl_pct_derived:    derivedPnlPct != null ? Math.round(derivedPnlPct * 100) / 100 : null,
           pnl_pct_diff:       pnlPctDiff != null ? Math.round(pnlPctDiff * 100) / 100 : null,
           pnl_pct_suspicious: !!pnlPctSuspicious,
+          // issue #8: surface a hard stop-loss breach so the Helm agent closes
+          // proactively (the deterministic backstop lives in recenterPosition).
+          stop_loss_breached: !pnlPctSuspicious && reportedPnlPct != null && config.management.stopLossPct != null && reportedPnlPct <= config.management.stopLossPct,
           unclaimed_fees_true_usd: lpData
             ? Math.round(safeNum(lpData.unCollectedFee) * 10000) / 10000
             : binData
@@ -2098,6 +2101,27 @@ export async function recenterPosition({ position_address, bins_below, strategy,
   if (!pos) return { success: false, error: "position not found" };
   const tracked = getTrackedPosition(position_address);
   const poolAddress = pos.pool;
+
+  // ── Hard stop-loss (issue #8) ──────────────────────────────────────
+  // Never recenter a position bleeding past the floor: recentering closes at
+  // the loss and redeploys SOL into a falling pool, crystallizing it (exactly
+  // how 锄头/SOL hit -37%). Below the stop, close instead — preserve the SOL.
+  // This is the live deterministic backstop since index.js's cron does not run
+  // in the Evonic-driven runtime; recenter is the CLI path the agent takes.
+  const _slPct = config.management.stopLossPct;
+  if (!pos.pnl_pct_suspicious && pos.pnl_pct != null && _slPct != null && pos.pnl_pct <= _slPct) {
+    const slReason = `Stop loss: recenter blocked at ${pos.pnl_pct}% <= ${_slPct}% — closing instead`;
+    log("recenter", `${pos.pair}: ${slReason}`);
+    const closed = await closePosition({ position_address, reason: slReason });
+    return {
+      success: !!closed.success,
+      recentered: false,
+      stop_loss: true,
+      closed_pnl_pct: closed.pnl_pct ?? pos.pnl_pct,
+      reason: slReason,
+      ...(closed.success ? {} : { stage: "stop_loss_close", error: closed.error }),
+    };
+  }
 
   // Pre-flight: if redeploy is guaranteed to abort, skip the close so the
   // position stays open instead of becoming a half-recentered orphan.
