@@ -224,7 +224,7 @@ function shapeGem(raw) {
  *   - 24h volume >= min_volume
  * Hunter still does per-candidate 5m deep-research (get_dex_velocity → true 5m).
  */
-export async function getMomentumCandidates({ limit = 5, min_change = 3, max_change = 80, min_tvl = 20000, min_volume = 0, chain = "solana" } = {}) {
+export async function getMomentumCandidates({ limit = 5, min_change = 3, max_change = 120, min_tvl = 20000, min_volume = 0, chain = "solana" } = {}) {
   const gems = await getBirdeyeGems({ chain, limit: 50, sort_by: "tf1h.priceChangePercent", sort_type: "desc" });
   if (!gems.items?.length) return { source: "birdeye-momentum", count: 0, candidates: [], note: gems.error || "no gems data" };
   const candidates = gems.items.filter((c) => {
