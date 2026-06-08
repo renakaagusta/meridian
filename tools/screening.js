@@ -44,6 +44,30 @@ function recordRejection(pool, reason) {
   } catch { /* logging must never break screening */ }
 }
 
+// ── Swarmscope rich-trace emitter (additive, fire-and-forget) ───────────────
+// Mirrors the screening funnel — passed + REJECTED candidates with the rule
+// that blocked each — to the swarmscope observability service. Never awaited,
+// never throws into the screening path; a 2.5s abort guards against hangs.
+const SWARMSCOPE_URL = process.env.SWARMSCOPE_URL || "";
+const SWARMSCOPE_KEY = process.env.SWARMSCOPE_KEY || "";
+function emitSwarmscope(payload) {
+  if (!SWARMSCOPE_URL || !SWARMSCOPE_KEY) return;
+  try {
+    const post = (path, body) => {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 2500);
+      fetch(`${SWARMSCOPE_URL}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": SWARMSCOPE_KEY },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      }).catch(() => {}).finally(() => clearTimeout(t));
+    };
+    post("/v1/decisions", payload);
+    post("/v1/agents/heartbeat", { name: "Screener", role: "meta", status: "online" });
+  } catch { /* observability must never break screening */ }
+}
+
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -841,6 +865,30 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         })),
       },
       decision: { pool: null },
+    });
+  } catch { /* non-fatal */ }
+
+  // ── Swarmscope: rich screening funnel (passed + rejected WITH blocking rule) ──
+  try {
+    const _ts = new Date().toISOString();
+    const _passed = eligible.map((c) => ({
+      ref: c.base?.mint ?? c.pool ?? null, name: c.name, passed: true, stage: "agent",
+      metrics: {
+        tvl: c.tvl ?? null, volume: c.volume ?? null, mcap: c.mcap ?? null,
+        fee_active_tvl_ratio: c.fee_active_tvl_ratio ?? null,
+        organic_score: c.organic_score ?? null, active_pct: c.active_pct ?? null,
+        volatility: c.volatility ?? null,
+      },
+    }));
+    const _cut = filteredOut.map((f) => ({
+      ref: null, name: f.name, passed: false, stage: "hard-rule", reason: f.reason, metrics: {},
+    }));
+    emitSwarmscope({
+      trace_id: `md:${_ts}`, ts: _ts, agent: "Screener", kind: "screening",
+      decision_type: "no_deploy",
+      summary: `${pools.length} screened → ${eligible.length} passed`,
+      considered: pools.length,
+      candidates: [..._passed, ..._cut],
     });
   } catch { /* non-fatal */ }
 
