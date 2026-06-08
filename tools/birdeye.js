@@ -219,15 +219,20 @@ function shapeGem(raw) {
 /**
  * Momentum-tuned SPOT candidate list (Hunter's primary source). Sources the
  * keyless Birdeye trending gems, sorts by 1h price momentum, and filters:
+ *   - chain == solana (the /multichain/v3/gems endpoint returns EVM tokens too)
  *   - 1h price change in [min_change, max_change] (positive momentum, reject blow-off)
  *   - liquidity >= min_tvl  (thin pools = slippage traps)
- *   - 24h volume >= min_volume
+ *   - 24h volume >= min_volume  (corpse filter — dead tokens waste a Hunter cycle)
  * Hunter still does per-candidate 5m deep-research (get_dex_velocity → true 5m).
  */
-export async function getMomentumCandidates({ limit = 5, min_change = 3, max_change = 120, min_tvl = 20000, min_volume = 0, chain = "solana" } = {}) {
+export async function getMomentumCandidates({ limit = 5, min_change = 3, max_change = 120, min_tvl = 20000, min_volume = 25000, chain = "solana" } = {}) {
   const gems = await getBirdeyeGems({ chain, limit: 50, sort_by: "tf1h.priceChangePercent", sort_type: "desc" });
   if (!gems.items?.length) return { source: "birdeye-momentum", count: 0, candidates: [], note: gems.error || "no gems data" };
   const candidates = gems.items.filter((c) => {
+    // The gems endpoint ignores the `chain` payload and mixes in base/bsc/ethereum
+    // (~47% of a sample). Hunter can only trade Solana, so drop the rest here
+    // rather than burn a research cycle SKIPping them for "wrong chain".
+    if ((c.network || "").toLowerCase() !== "solana") return false;
     const ch = c.velocity?.["1h"]?.price_change_pct;
     const vol = c.velocity?.["24h"]?.volume_usd ?? 0;
     return typeof ch === "number" && ch >= min_change && ch <= max_change
@@ -235,7 +240,7 @@ export async function getMomentumCandidates({ limit = 5, min_change = 3, max_cha
   }).slice(0, limit);
   return {
     source: "birdeye-momentum",
-    filters: { min_change, max_change, min_tvl, min_volume },
+    filters: { min_change, max_change, min_tvl, min_volume, chain: "solana" },
     screened: gems.items.length,
     count: candidates.length,
     candidates,

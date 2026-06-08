@@ -817,7 +817,7 @@ switch (subcommand) {
       min_change: flags["min-change"] != null ? parseFloat(flags["min-change"]) : 3,
       max_change: flags["max-change"] != null ? parseFloat(flags["max-change"]) : 120,
       min_tvl: flags["min-tvl"] != null ? parseFloat(flags["min-tvl"]) : 20000,
-      min_volume: flags["min-volume"] != null ? parseFloat(flags["min-volume"]) : 0,
+      min_volume: flags["min-volume"] != null ? parseFloat(flags["min-volume"]) : 25000,
       chain: flags.chain || "solana",
     }));
     break;
