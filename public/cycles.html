@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Meridian — Cycle Funnel</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#11151f; --panel2:#0e121b; --line:#1e2433; --text:#dbe2f0;
+    --muted:#8a93a6; --accent:#6ee7b7; --warn:#f0b35b; --bad:#ff7a93; --info:#56b6c2;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+  a{color:var(--accent);text-decoration:none}
+  header{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,#0b0e14ee,#0b0e14cc);
+    backdrop-filter:blur(6px);border-bottom:1px solid var(--line);padding:14px 20px}
+  h1{margin:0 0 2px;font-size:16px;letter-spacing:.5px}
+  .sub{color:var(--muted);font-size:12px}
+  .nav{margin-top:8px;display:flex;gap:14px;font-size:13px}
+  .nav a{color:var(--muted)} .nav a.on{color:var(--accent)}
+  .controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;align-items:center}
+  #q{flex:1;min-width:180px;background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    color:var(--text);padding:6px 10px;font:inherit}
+  .chip{cursor:pointer;user-select:none;border:1px solid var(--line);background:var(--panel);
+    color:var(--text);padding:3px 10px;border-radius:999px;font-size:12px;opacity:.5}
+  .chip.on{opacity:1;border-color:currentColor}
+
+  main{display:grid;grid-template-columns:340px 1fr;gap:0;height:calc(100vh - 132px)}
+  @media(max-width:820px){main{grid-template-columns:1fr;height:auto}.detailwrap{border-left:none!important}}
+  .list{overflow:auto;border-right:1px solid var(--line);padding:12px}
+  .detailwrap{overflow:auto;padding:18px 22px}
+
+  .ci{cursor:pointer;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--c,#456);
+    border-radius:9px;padding:10px 12px;margin-bottom:9px}
+  .ci.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .ci .row1{display:flex;align-items:center;gap:7px}
+  .badge{font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:1px 7px;border-radius:5px;
+    background:var(--c,#456);color:#06080d;font-weight:700}
+  .when{color:var(--muted);font-size:11px;margin-left:auto}
+  .ci .sum{color:#c2cadb;font-size:12.5px;margin-top:5px}
+  .ci .fn{color:var(--muted);font-size:11px;margin-top:5px}
+
+  .empty{color:var(--muted);text-align:center;padding:60px 16px}
+  h2{font-size:15px;margin:0 0 2px}
+  .dhead{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:4px}
+  .dsub{color:var(--muted);font-size:12px;margin-bottom:16px}
+
+  .funnel{display:flex;align-items:stretch;gap:6px;margin:6px 0 20px;flex-wrap:wrap}
+  .stage{flex:1;min-width:96px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:10px 12px}
+  .stage .n{font-size:22px;font-weight:700}
+  .stage .l{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+  .stage.pass .n{color:var(--accent)} .stage.cut .n{color:var(--bad)} .stage.deploy .n{color:var(--warn)}
+
+  section.blk{margin:0 0 18px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .blk > .bh{display:flex;align-items:center;gap:8px;padding:9px 12px;background:var(--panel2);
+    border-bottom:1px solid var(--line);font-size:12.5px;font-weight:600}
+  .bh .cnt{margin-left:auto;color:var(--muted);font-weight:400;font-size:11.5px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:6px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.3px}
+  tr:last-child td{border-bottom:none}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .tok{font-weight:700}
+  .reason{color:#cdb4a0}
+  .deployrow{background:#6ee7b71a}
+  .tag{display:inline-block;font-size:10px;padding:1px 6px;border-radius:4px;border:1px solid var(--line);color:var(--muted);margin:1px 3px 1px 0}
+  .tag.sw{color:var(--accent);border-color:#6ee7b755}
+  .rule{font-size:10px;font-weight:700;padding:1px 7px;border-radius:5px;text-transform:uppercase}
+  .rule.CLOSE{background:var(--bad);color:#06080d}.rule.CLAIM{background:var(--warn);color:#06080d}
+  .rule.HOLD,.rule.NONE{background:var(--line);color:var(--muted)}.rule.RECENTER{background:var(--info);color:#06080d}
+  .pos{color:var(--accent)}.neg{color:var(--bad)}
+  .ir-yes{color:var(--accent)}.ir-no{color:var(--bad)}
+
+  .why{padding:12px}
+  .why pre{margin:0;white-space:pre-wrap;word-break:break-word;color:#c8d0e0;font-size:12px}
+  details{margin-top:10px}
+  details summary{cursor:pointer;color:var(--muted);font-size:12px}
+  details pre{margin-top:8px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    padding:10px;max-height:360px;overflow:auto;font-size:11.5px;white-space:pre-wrap;word-break:break-word;color:#b9c2d6}
+  .miss{color:var(--muted);font-size:12px;padding:10px 12px}
+  footer{color:var(--muted);text-align:center;padding:14px;font-size:11px;border-top:1px solid var(--line)}
+</style>
+</head>
+<body>
+<header>
+  <h1>◎ MERIDIAN — Cycle Funnel</h1>
+  <div class="sub" id="sub">loading…</div>
+  <div class="nav">
+    <a href="/">Timeline</a>
+    <a href="/cycles" class="on">Cycles</a>
+    <a href="/memory">Memory</a>
+  </div>
+  <div class="controls">
+    <input id="q" placeholder="search token / pair across every cycle…" autocomplete="off" />
+    <span class="chip on" data-f="all">all</span>
+    <span class="chip" data-f="screening">screening</span>
+    <span class="chip" data-f="management">management</span>
+  </div>
+</header>
+
+<main>
+  <div class="list" id="list"></div>
+  <div class="detailwrap" id="detail">
+    <div class="empty">Select a cycle on the left to see its decision funnel.</div>
+  </div>
+</main>
+<footer>auto-refreshes every 30s · newest first · the screener funnel shows every asset and why it was kept or cut</footer>
+
+<script>
+const C = { screening:"#56b6c2", management:"#f0b35b" };
+let CYCLES = [], FILTER = "all", Q = "", SEL = null;
+
+const esc = (s) => String(s==null?"":s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const when = (ts) => { try { return new Date(ts).toLocaleString(); } catch { return ts||""; } };
+const ago = (ts) => { try {
+  const s=(Date.now()-new Date(ts))/1000; if(s<60)return"just now"; if(s<3600)return Math.floor(s/60)+"m ago";
+  if(s<86400)return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago";
+} catch { return ""; } };
+const num = (v, d=2) => (v==null||v===""||isNaN(+v)) ? "—" : (+v).toLocaleString(undefined,{maximumFractionDigits:d});
+const usd = (v) => v==null?"—":"$"+num(v,2);
+
+function tokensOf(c){
+  const t=[];
+  (c.passed||[]).forEach(p=>t.push(p.name));
+  (c.filtered||[]).forEach(f=>t.push(f.name));
+  (c.early_filtered||[]).forEach(f=>t.push(f.name));
+  (c.positions||[]).forEach(p=>t.push(p.pair));
+  if(c.decision_summary) t.push(c.decision_summary);
+  return t.join(" ").toLowerCase();
+}
+
+function visible(){
+  const q=Q.trim().toLowerCase();
+  return CYCLES.filter(c =>
+    (FILTER==="all" || c.cycle===FILTER) &&
+    (!q || tokensOf(c).includes(q))
+  );
+}
+
+function summarize(c){
+  if(c.cycle==="screening"){
+    const dep = c.deployed ? `deployed ${c.deployed.pool_name||"position"}` : "no deploy";
+    return `${c.considered??(c.passed?.length||0)} considered → ${c.passed?.length||0} reached agent → ${dep}`;
+  }
+  if(c.cycle==="management"){
+    const n=c.positions?.length||0;
+    const acts=(c.positions||[]).filter(p=>p.rule && !["HOLD","NONE",null].includes(p.rule)).length;
+    return `${n} position${n===1?"":"s"} reviewed · ${acts} action${acts===1?"":"s"}`;
+  }
+  return c.decision_summary||"—";
+}
+
+function renderList(){
+  const items=visible();
+  document.getElementById("sub").textContent =
+    `${CYCLES.length} cycles loaded · ${items.length} shown` + (CYCLES[0]?` · latest ${ago(CYCLES[0].ts)}`:"");
+  const el=document.getElementById("list");
+  if(!items.length){ el.innerHTML=`<div class="empty">No cycles match.</div>`; return; }
+  el.innerHTML=items.map(c=>`
+    <div class="ci ${SEL===c.id?"sel":""}" style="--c:${C[c.cycle]||'#456'}" data-id="${c.id}">
+      <div class="row1">
+        <span class="badge">${esc(c.cycle)}</span>
+        <span class="when">${ago(c.ts)}</span>
+      </div>
+      <div class="sum">${esc(summarize(c))}</div>
+      ${c.cycle==="screening"?`<div class="fn">${c.passed?.length||0} kept · ${(c.filtered?.length||0)+(c.early_filtered?.length||0)} cut${c.error?` · ⚠ error`:""}</div>`:""}
+      ${c.error?`<div class="fn" style="color:var(--bad)">⚠ ${esc(c.error).slice(0,80)}</div>`:""}
+    </div>`).join("");
+  el.querySelectorAll(".ci").forEach(n=>n.onclick=()=>select(n.dataset.id));
+}
+
+function metricsCols(passed){
+  const present=new Set();
+  (passed||[]).forEach(p=>Object.keys(p.metrics||{}).forEach(k=>present.add(k)));
+  const order=["tvl","volume","volatility","mcap","bin_step","fee_pct","fee_active_tvl_ratio","fee_tvl_ratio","organic_score","apr"];
+  return order.filter(k=>present.has(k));
+}
+const labelOf={tvl:"TVL",volume:"Vol",volatility:"Volat",mcap:"MCap",bin_step:"Bin",
+  fee_pct:"Fee%",fee_active_tvl_ratio:"Fee/aTVL",fee_tvl_ratio:"Fee/TVL",organic_score:"Organic",apr:"APR"};
+
+function renderScreening(c){
+  const cut=(c.filtered?.length||0)+(c.early_filtered?.length||0);
+  const cols=metricsCols(c.passed);
+  const passRows=(c.passed||[]).map(p=>{
+    const isDep=c.deployed && (p.name===c.deployed.pool_name);
+    const mcells=cols.map(k=>`<td class="num">${num(p.metrics?.[k], k==="organic_score"?0:2)}</td>`).join("");
+    const sw=(p.smart_wallets||[]).map(w=>`<span class="tag sw">${esc(w)}</span>`).join("");
+    return `<tr class="${isDep?"deployrow":""}">
+      <td class="tok">${isDep?"★ ":""}${esc(p.name)}</td>${mcells}
+      <td>${sw||(p.narrative?`<span class="tag">${esc(String(p.narrative).slice(0,40))}</span>`:'<span style="color:var(--muted)">—</span>')}</td>
+    </tr>`;
+  }).join("");
+
+  const cutRows=(arr,kind)=>(arr||[]).map(f=>`<tr>
+      <td class="tok">${esc(f.name)}</td><td class="reason">${esc(f.reason)}</td>
+      <td style="color:var(--muted)">${kind}</td></tr>`).join("");
+
+  return `
+  <div class="funnel">
+    <div class="stage"><div class="n">${c.considered??(c.passed?.length||0)}</div><div class="l">considered</div></div>
+    <div class="stage cut"><div class="n">${cut}</div><div class="l">cut by rules</div></div>
+    <div class="stage pass"><div class="n">${c.passed?.length||0}</div><div class="l">reached agent</div></div>
+    <div class="stage deploy"><div class="n">${c.deployed?1:0}</div><div class="l">deployed</div></div>
+  </div>
+
+  ${cut?`<section class="blk">
+    <div class="bh">✗ Cut before the agent saw them — why they didn't pass the screener<span class="cnt">${cut} assets</span></div>
+    <table><thead><tr><th>Token</th><th>Reason</th><th>Stage</th></tr></thead>
+    <tbody>${cutRows(c.early_filtered,"pre-filter")}${cutRows(c.filtered,"hard rule")}</tbody></table>
+  </section>`:""}
+
+  <section class="blk">
+    <div class="bh">✓ Passed to the agent — these are what it chose among${c.deployed?` (★ = deployed)`:""}<span class="cnt">${c.passed?.length||0} assets</span></div>
+    ${(c.passed?.length)?`<table><thead><tr><th>Token</th>${cols.map(k=>`<th class="num">${labelOf[k]||k}</th>`).join("")}<th>Signals</th></tr></thead>
+      <tbody>${passRows}</tbody></table>`:`<div class="miss">No candidates reached the agent this cycle.</div>`}
+  </section>`;
+}
+
+function renderManagement(c){
+  const rows=(c.positions||[]).map(p=>{
+    const rule=(p.rule||"NONE").toString().toUpperCase().split(/\s|_/)[0];
+    const pnl=p.pnl_pct;
+    const pnlc=pnl==null?"":(pnl>=0?"pos":"neg");
+    return `<tr>
+      <td class="tok">${esc(p.pair||p.position?.slice?.(0,8)||"—")}</td>
+      <td class="num ${pnlc}">${pnl==null?"—":(pnl>=0?"+":"")+num(pnl,2)+"%"}</td>
+      <td>${p.in_range==null?"—":(p.in_range?'<span class="ir-yes">in range</span>':'<span class="ir-no">OUT</span>')}</td>
+      <td class="num">${p.minutes_out_of_range==null?"—":num(p.minutes_out_of_range,0)+"m"}</td>
+      <td class="num">${usd(p.unclaimed_fees_usd)}</td>
+      <td><span class="rule ${rule}">${esc(rule)}</span></td>
+      <td class="reason">${esc(p.instruction||"")}</td>
+    </tr>`;
+  }).join("");
+  return `
+  <section class="blk">
+    <div class="bh">Positions reviewed — the rule that fired decides close / claim / hold<span class="cnt">${c.positions?.length||0}</span></div>
+    ${(c.positions?.length)?`<table><thead><tr><th>Pair</th><th class="num">PnL</th><th>Range</th><th class="num">OOR</th><th class="num">Unclaimed</th><th>Rule</th><th>Note</th></tr></thead>
+      <tbody>${rows}</tbody></table>`:`<div class="miss">No open positions this cycle.</div>`}
+  </section>`;
+}
+
+async function select(id){
+  SEL=id; renderList();
+  const c=CYCLES.find(x=>x.id===id);
+  const d=document.getElementById("detail");
+  if(!c){ d.innerHTML=`<div class="empty">Cycle not found.</div>`; return; }
+  const badge=`<span class="badge" style="background:${C[c.cycle]||'#456'}">${esc(c.cycle)}</span>`;
+  const head=`
+    <div class="dhead">${badge}<h2>${esc(c.decision_summary||summarize(c))}</h2></div>
+    <div class="dsub">${esc(when(c.ts))} · actor ${esc(c.actor||"—")} · id ${esc(c.id)}</div>`;
+  const body = c.cycle==="screening" ? renderScreening(c)
+            : c.cycle==="management" ? renderManagement(c)
+            : `<div class="miss">${esc(c.decision_summary||"No structured funnel for this cycle type.")}</div>`;
+  d.innerHTML = head + body + `<section class="blk"><div class="bh">Why — the agent's own reasoning</div>
+    <div class="why" id="why"><div class="miss">loading reasoning…</div></div></section>`;
+  loadWhy(c);
+}
+
+async function loadWhy(c){
+  const w=document.getElementById("why");
+  if(!w) return;
+  if(!c.has_reasoning){ w.innerHTML=`<div class="miss">No reasoning recorded for this cycle.</div>`; return; }
+  try{
+    const t=await (await fetch("/api/trace?id="+encodeURIComponent(c.id))).json();
+    const final=t.final_content || t.final_content_raw || "";
+    const tr=Array.isArray(t.transcript)?t.transcript:[];
+    const trText=tr.map(s=>{
+      if(typeof s==="string") return s;
+      const role=s.role||s.type||"step";
+      const content=s.content||s.text||(s.tool?`[tool ${s.tool}] ${JSON.stringify(s.args||{})}`:JSON.stringify(s));
+      return `── ${role} ──\n${typeof content==="string"?content:JSON.stringify(content,null,2)}`;
+    }).join("\n\n");
+    const ch=Array.isArray(t.challenger)&&t.challenger.length
+      ? `<details><summary>Challenger verdicts (${t.challenger.length})</summary><pre>${esc(JSON.stringify(t.challenger,null,2))}</pre></details>`:"";
+    const cfg=c.config?`<details><summary>Thresholds active at decision time</summary><pre>${esc(JSON.stringify(c.config,null,2))}</pre></details>`:"";
+    w.innerHTML =
+      (final?`<pre>${esc(final)}</pre>`:`<div class="miss">No final summary text.</div>`) +
+      (trText?`<details><summary>Full step-by-step transcript (${tr.length} steps)</summary><pre>${esc(trText)}</pre></details>`:"") +
+      ch + cfg;
+  }catch(e){ w.innerHTML=`<div class="miss">Failed to load reasoning: ${esc(e.message)}</div>`; }
+}
+
+async function load(){
+  try{
+    const r=await (await fetch("/api/cycles?limit=200")).json();
+    CYCLES=r.cycles||[];
+    if(SEL && !CYCLES.find(c=>c.id===SEL)) SEL=null;
+    renderList();
+    if(SEL){ const c=CYCLES.find(x=>x.id===SEL); if(c){ /* keep detail; refresh why only if needed */ } }
+  }catch(e){ document.getElementById("sub").textContent="failed to load: "+e.message; }
+}
+
+document.getElementById("q").addEventListener("input",e=>{Q=e.target.value;renderList();});
+document.querySelectorAll(".chip").forEach(ch=>ch.onclick=()=>{
+  document.querySelectorAll(".chip").forEach(x=>x.classList.remove("on"));
+  ch.classList.add("on"); FILTER=ch.dataset.f; renderList();
+});
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

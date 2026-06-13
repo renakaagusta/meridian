@@ -74,7 +74,7 @@ export function appendDecision(entry) {
     const m = decision.metrics || {};
     const isMgmt = decision.type !== "deploy";
     const key = (decision.position || decision.pool).slice(0, 8);
-    emitSwarmscope("/v1/decisions", {
+    emitSwarmscope("/v1/decisions", { namespace: "meridian-dlmm",
       trace_id: `md:${decision.type}:${decision.ts}:${key}`,
       ts: decision.ts,
       agent: decision.actor === "MANAGER" ? "Manager" : "Screener",
@@ -92,7 +92,7 @@ export function appendDecision(entry) {
         detail: { reason: decision.reason, risks: decision.risks, ...m },
       }],
     });
-    emitSwarmscope("/v1/agents/heartbeat", { name: decision.actor === "MANAGER" ? "Manager" : "Screener", role: "meta", status: "online" });
+    emitSwarmscope("/v1/agents/heartbeat", { namespace: "meridian-dlmm", name: decision.actor === "MANAGER" ? "Manager" : "Screener", role: "meta", status: "online" });
   }
   return decision;
 }

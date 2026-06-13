@@ -26,6 +26,29 @@ const FETCH_TIMEOUT_MS = Number(process.env.MERIDIAN_BIRDEYE_TIMEOUT_MS || 35000
 
 const logErr = (tag, msg) => console.error(`[birdeye] ${tag}: ${msg}`);
 
+// ── Swarmscope meme-stack emitter (additive, fire-and-forget) ───────────────
+// Mirrors Hunter's momentum screen as a meme-stack decision cycle (passed +
+// rejected candidates with the rule that cut each). Explicit namespace so the
+// inherited admin key (env precedence over --env-file) lands in the right stack.
+const _SW_URL = process.env.SWARMSCOPE_URL || "";
+const _SW_KEY = process.env.SWARMSCOPE_KEY || "";
+async function _emitMemeScreen(payload) {
+  // Awaited (not fire-and-forget): the meme screen runs inside the short-lived
+  // `cli.js momentum-candidates` subprocess, which process.exit(0)s right after
+  // output — an un-awaited fetch would be killed before it flushes.
+  if (!_SW_URL || !_SW_KEY) return;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 2500);
+    await fetch(`${_SW_URL}/v1/decisions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": _SW_KEY },
+      body: JSON.stringify({ namespace: "meridian-meme", ...payload }),
+      signal: ctrl.signal,
+    }).catch(() => {}).finally(() => clearTimeout(t));
+  } catch { /* never break screening */ }
+}
+
 function withTimeout(promise, ms) {
   return Promise.race([
     promise,
@@ -238,6 +261,42 @@ export async function getMomentumCandidates({ limit = 5, min_change = 3, max_cha
     return typeof ch === "number" && ch >= min_change && ch <= max_change
       && (c.liquidity_usd ?? 0) >= min_tvl && vol >= min_volume;
   }).slice(0, limit);
+
+  // ── Swarmscope: emit this momentum screen as a meme-stack cycle ──
+  try {
+    const _reason = (c) => {
+      if ((c.network || "").toLowerCase() !== "solana") return "wrong chain (not Solana)";
+      const ch = c.velocity?.["1h"]?.price_change_pct;
+      const vol = c.velocity?.["24h"]?.volume_usd ?? 0;
+      if (typeof ch !== "number") return "no 1h price-change data";
+      if (ch < min_change) return `1h change ${ch}% < min ${min_change}%`;
+      if (ch > max_change) return `1h change ${ch}% > max ${max_change}%`;
+      if ((c.liquidity_usd ?? 0) < min_tvl) return `liquidity $${c.liquidity_usd ?? 0} < $${min_tvl}`;
+      if (vol < min_volume) return `24h vol $${vol} < $${min_volume}`;
+      return null;
+    };
+    const _met = (c) => ({
+      change_1h_pct: c.velocity?.["1h"]?.price_change_pct ?? null,
+      vol_24h: c.velocity?.["24h"]?.volume_usd ?? null,
+      liquidity: c.liquidity_usd ?? null,
+      mcap: c.market_cap ?? c.mcap ?? null,
+    });
+    const passedCands = candidates.map((c) => ({
+      ref: c.address ?? c.mint ?? null, name: c.name ?? c.symbol ?? "—",
+      passed: true, stage: "agent", metrics: _met(c),
+    }));
+    const cutCands = gems.items.map((c) => ({ c, r: _reason(c) })).filter((x) => x.r).slice(0, 30)
+      .map(({ c, r }) => ({ ref: c.address ?? c.mint ?? null, name: c.name ?? c.symbol ?? "—", passed: false, stage: "hard-rule", reason: r, metrics: {} }));
+    const _ts = new Date().toISOString();
+    await _emitMemeScreen({
+      trace_id: `meme:${_ts}`, ts: _ts, agent: "Hunter", kind: "screening",
+      decision_type: "no_deploy",
+      summary: `${gems.items.length} screened → ${candidates.length} candidates`,
+      considered: gems.items.length,
+      candidates: [...passedCands, ...cutCands],
+    });
+  } catch { /* non-fatal */ }
+
   return {
     source: "birdeye-momentum",
     filters: { min_change, max_change, min_tvl, min_volume, chain: "solana" },
@@ -338,4 +397,79 @@ export async function getBirdeyeMarkets({ mint, chain = "solana" } = {}) {
     volume_24h_usd: m.volume24h ?? null,
   }));
   return { found: true, source: "birdeye-markets", mint, count: markets.length, markets };
+}
+
+/**
+ * 7-day range position analysis via GeckoTerminal (free, keyless).
+ * Computes where current price sits in the last 168 hourly closes:
+ *   pct_of_7d_range — (price − 7d_low) / (7d_high − 7d_low) × 100
+ *   percentile_7d   — % of 168 hourly closes that are below current price
+ * Used by Hunter to detect range-ceiling entries (issue #46 Gate 5).
+ */
+export async function getPriceRangeContext({ mint, pool_address, chain = "solana" } = {}) {
+  if (!mint && !pool_address) return { found: false, error: "mint or pool_address required" };
+
+  // Resolve pool address from DexScreener if not provided
+  let pool = pool_address;
+  if (!pool) {
+    try {
+      const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+        signal: AbortSignal.timeout(8000),
+      });
+      const d = await r.json();
+      const pairs = (d?.pairs || []).filter((p) => p.chainId === chain || p.chainId === "solana");
+      pairs.sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+      pool = pairs[0]?.pairAddress ?? null;
+    } catch {
+      pool = null;
+    }
+  }
+
+  if (!pool) return { found: false, mint, error: "could not resolve pool address" };
+
+  try {
+    const url = `https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/hour?limit=168&currency=usd&token=base`;
+    const r = await fetch(url, {
+      headers: { "Accept": "application/json", "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!r.ok) return { found: false, mint, pool, error: `GeckoTerminal HTTP ${r.status}` };
+    const d = await r.json();
+    const raw = d?.data?.attributes?.ohlcv_list ?? [];
+    if (raw.length < 24) return { found: false, mint, pool, error: "insufficient history (<24h)", candles: raw.length };
+
+    const closes = raw.map((c) => parseFloat(c[4])).filter((v) => isFinite(v) && v > 0);
+    closes.sort((a, b) => a - b); // sort for percentile calc
+    const hi = closes[closes.length - 1];
+    const lo = closes[0];
+    const median = closes[Math.floor(closes.length / 2)];
+    // current price = last candle close (raw is oldest-first)
+    const current = parseFloat(raw[raw.length - 1][4]);
+    const pct_of_7d_range = hi > lo ? +((( current - lo) / (hi - lo)) * 100).toFixed(1) : null;
+    const below = closes.filter((c) => c < current).length;
+    const percentile_7d = +(( below / closes.length) * 100).toFixed(1);
+
+    // Rough support/resistance: 25th and 75th percentile closes
+    const p25 = closes[Math.floor(closes.length * 0.25)];
+    const p75 = closes[Math.floor(closes.length * 0.75)];
+
+    return {
+      found: true,
+      source: "geckoterminal-7d",
+      mint,
+      pool,
+      candles: closes.length,
+      current_price: +current.toFixed(8),
+      range_7d: { high: +hi.toFixed(8), low: +lo.toFixed(8), median: +median.toFixed(8) },
+      pct_of_7d_range,
+      percentile_7d,
+      support: +p25.toFixed(8),
+      resistance: +p75.toFixed(8),
+      dist_from_high_pct: +((current / hi - 1) * 100).toFixed(1),
+      dist_from_low_pct: +((current / lo - 1) * 100).toFixed(1),
+    };
+  } catch (e) {
+    return { found: false, mint, pool, error: String(e.message ?? e) };
+  }
 }

@@ -64,7 +64,7 @@ function emitSwarmscope(payload) {
       }).catch(() => {}).finally(() => clearTimeout(t));
     };
     post("/v1/decisions", payload);
-    post("/v1/agents/heartbeat", { name: "Screener", role: "meta", status: "online" });
+    post("/v1/agents/heartbeat", { namespace: "meridian-dlmm", name: "Screener", role: "meta", status: "online" });
   } catch { /* observability must never break screening */ }
 }
 
@@ -884,7 +884,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       ref: null, name: f.name, passed: false, stage: "hard-rule", reason: f.reason, metrics: {},
     }));
     emitSwarmscope({
-      trace_id: `md:${_ts}`, ts: _ts, agent: "Screener", kind: "screening",
+      trace_id: `md:${_ts}`, ts: _ts, namespace: "meridian-dlmm", agent: "Screener", kind: "screening",
       decision_type: "no_deploy",
       summary: `${pools.length} screened → ${eligible.length} passed`,
       considered: pools.length,

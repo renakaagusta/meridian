@@ -882,6 +882,15 @@ switch (subcommand) {
     break;
   }
 
+
+  // -- price-range-context --mint <addr> [--pool <addr>] -- 7d range position (Gate 5)
+  case "price-range-context": {
+    const mint = flags.mint;
+    if (!mint) die("Usage: meridian price-range-context --mint <token_mint> [--pool <pool_address>]");
+    const { getPriceRangeContext } = await import("./tools/birdeye.js");
+    out(await getPriceRangeContext({ mint, pool_address: flags.pool || null }));
+    break;
+  }
   // ── gmgn-wallet-tags --mint <addr> — keyless GMGN wallet-cohort counts ─
   case "gmgn-wallet-tags": {
     const mint = flags.mint;

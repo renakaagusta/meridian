@@ -12,7 +12,7 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { readTraceSummaries, getTrace } from "./decision-trace.js";
+import { readTraceSummaries, getTrace, readTraces } from "./decision-trace.js";
 import { getLessonsForPrompt, listLessons, getPerformanceSummary } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
 
@@ -169,6 +169,83 @@ function buildTimeline() {
   return events;
 }
 
+// ── Per-cycle decision FUNNEL (the "why included / why rejected / why closed" view) ──
+const CANDIDATE_METRIC_KEYS = [
+  "tvl", "volume", "volatility", "mcap", "bin_step",
+  "fee_pct", "fee_active_tvl_ratio", "fee_tvl_ratio", "organic_score", "apr",
+];
+
+function pickMetrics(pool) {
+  const m = {};
+  for (const k of CANDIDATE_METRIC_KEYS) if (pool?.[k] != null) m[k] = pool[k];
+  return m;
+}
+
+// Filtered entries are sometimes {name, reason}, sometimes a bare string.
+function normFiltered(f) {
+  if (f == null) return null;
+  if (typeof f === "string") return { name: "—", reason: f };
+  return { name: f.name || f.pool_name || "—", reason: f.reason || f.note || "" };
+}
+
+function buildCycles({ limit = 150 } = {}) {
+  return readTraces({ limit }).map((t) => {
+    const base = {
+      id: t.id,
+      ts: t.ts,
+      cycle: t.cycle,
+      actor: t.actor,
+      decision_type: t.decision?.type || null,
+      decision_summary: t.decision?.summary || null,
+      error: t.error || null,
+      has_reasoning: !!(t.final_content || (t.transcript || []).length),
+    };
+
+    if (t.cycle === "screening") {
+      const passed = (t.inputs?.candidates || []).map((c) => ({
+        name: c.name || c.pool_name || "—",
+        address: c.address || c.pool_address || c.pool || null,
+        metrics: pickMetrics(c),
+        smart_wallets: c._smart_wallets || [],
+        narrative: c._narrative || null,
+      }));
+      return {
+        ...base,
+        considered: t.inputs?.candidates_considered ?? passed.length,
+        passed,
+        filtered: (t.inputs?.filtered || []).map(normFiltered).filter(Boolean),
+        early_filtered: (t.inputs?.early_filtered || []).map(normFiltered).filter(Boolean),
+        deployed: t.decision?.type === "deploy"
+          ? { pool_name: t.decision.pool_name, position: t.decision.position }
+          : null,
+        config: t.inputs?.config_snapshot?.screening || null,
+      };
+    }
+
+    if (t.cycle === "management") {
+      return {
+        ...base,
+        positions: (t.inputs?.positions || []).map((p) => ({
+          pair: p.pair,
+          pool: p.pool,
+          position: p.position,
+          pnl_pct: p.pnl_pct,
+          in_range: p.in_range,
+          minutes_out_of_range: p.minutes_out_of_range,
+          unclaimed_fees_usd: p.unclaimed_fees_usd,
+          total_value_usd: p.total_value_usd,
+          rule: p.rule || null,
+          instruction: p.instruction || null,
+        })),
+        actions_required: t.inputs?.actions_required || [],
+        config: t.inputs?.config_snapshot?.management || null,
+      };
+    }
+
+    return base;
+  });
+}
+
 const PAGE = path.join(__dirname, "public", "timeline.html");
 
 export function startWebServer(port = 8420) {
@@ -178,6 +255,22 @@ export function startWebServer(port = 8420) {
       const body = JSON.stringify({ events: buildTimeline(), generated_at: new Date().toISOString() });
       res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
       res.end(body);
+      return;
+    }
+    if (url.pathname === "/api/cycles") {
+      const limit = Math.min(500, Number(url.searchParams.get("limit")) || 150);
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify({ cycles: buildCycles({ limit }), generated_at: new Date().toISOString() }));
+      return;
+    }
+    if (url.pathname === "/cycles") {
+      try {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(fs.readFileSync(path.join(__dirname, "public", "cycles.html"), "utf8"));
+      } catch {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("cycles.html not found");
+      }
       return;
     }
     if (url.pathname === "/api/trace") {
