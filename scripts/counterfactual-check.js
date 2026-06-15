@@ -48,7 +48,8 @@ const opt = (n, d) => { const i = args.indexOf(n); return i >= 0 ? Number(args[i
 const CYCLES = opt("--cycles", 12);
 const MIN_AGE_H = opt("--minAgeH", 2);
 const REJECT_HRS = opt("--rejectHrs", 48);
-const SPOT_HRS = opt("--spotHrs", 48); // Hunter-skip lookback window for Stage 3
+const SPOT_HRS = opt("--spotHrs", 48);  // Hunter-skip lookback window for Stage 3
+const SPOT_MAX = opt("--spotMax", 60);  // cap Stage 3 tokens graded (most-recent first) — keeps runtime bounded
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
@@ -92,7 +93,12 @@ async function readHunterSkips({ sinceHrs, cutoffMs }) {
          and ts > datetime('now', ?) order by ts desc`
     ).all(HUNTER_AGENT, `-${Math.round(sinceHrs)} hours`);
     db.close?.();
+    const distinctInWindow = new Set(rows.map((r) => r.asset_mint)).size;
+    if (distinctInWindow > SPOT_MAX) {
+      console.log(`[counterfactual] Stage 3: ${distinctInWindow} distinct Hunter skips in ${SPOT_HRS}h — grading the ${SPOT_MAX} most recent (raise with --spotMax)`);
+    }
     for (const r of rows) {
+      if (out.size >= SPOT_MAX) break; // rows are DESC by ts → keep the most recent SPOT_MAX
       const tsMs = Date.parse(r.ts.replace(" ", "T") + "Z"); // decision_log ts is UTC
       if (!Number.isFinite(tsMs) || tsMs > cutoffMs) continue; // too fresh to judge
       const mint = r.asset_mint;
