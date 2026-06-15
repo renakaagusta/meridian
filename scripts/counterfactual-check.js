@@ -55,6 +55,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 const numOrNull = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
 
+// A token that "ran" but was skipped on a HARD risk signal was NOT a recoverable
+// miss — it was an un-buyable rug/blow-off/thin-pool. Only a miss skipped WITHOUT
+// any hard term is a candidate for genuine recoverable edge. Returns the matched
+// hard term (→ correct avoid) or null (→ recoverable, worth a closer look).
+const HARD_SKIP_TERMS = [
+  "blow-off", "blow off", "spike-top", "spike top", "bundler", "single-whale", "single whale",
+  "hlnpsz9h", "cluster", "pre-graduation", "graduated=false", "<< ", "hard floor", "below $20k",
+  "dangerously low", "thin liquid", "rugcheck", "danger", "critical", "unrenounced",
+  "is_renounced null", "lock=0", "lock_percent=0", "lp unlocked", "lp 100% unlocked",
+  "collapsing", "collapse", "distribution", "dump", "dev holding", "dev_team_hold", "top10",
+  "top_10", "bot ", "bot_degen", "fabricat", "image_dup", "brand squat", "paid boost", "paid promotion",
+];
+function classifySkipReason(reason) {
+  const rl = (reason || "").toLowerCase();
+  const hit = HARD_SKIP_TERMS.find((t) => rl.includes(t));
+  return { recoverable: !hit, hard_term: hit || null };
+}
+
 function readJsonl(file) {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, "utf8").split("\n").filter(Boolean)
@@ -88,7 +106,7 @@ async function readHunterSkips({ sinceHrs, cutoffMs }) {
       ).all(HUNTER_AGENT, "meridian_trader_manager").map((r) => r.m)
     );
     const rows = db.prepare(
-      `select ts, asset_mint, asset_symbol from decision_log
+      `select ts, asset_mint, asset_symbol, primary_reason from decision_log
        where agent_id = ? and decision = 'SKIP' and asset_mint is not null
          and ts > datetime('now', ?) order by ts desc`
     ).all(HUNTER_AGENT, `-${Math.round(sinceHrs)} hours`);
@@ -103,7 +121,7 @@ async function readHunterSkips({ sinceHrs, cutoffMs }) {
       if (!Number.isFinite(tsMs) || tsMs > cutoffMs) continue; // too fresh to judge
       const mint = r.asset_mint;
       if (bought.has(mint) || out.has(mint)) continue;
-      out.set(mint, { name: r.asset_symbol || mint.slice(0, 6), base_mint: mint, ts: r.ts, fee0: 0, vol0: 0 });
+      out.set(mint, { name: r.asset_symbol || mint.slice(0, 6), base_mint: mint, ts: r.ts, reason: r.primary_reason || "", fee0: 0, vol0: 0 });
     }
   } catch (e) {
     console.log(`[counterfactual] Stage 3 skipped — evonic DB read failed: ${e.message}`);
@@ -221,9 +239,14 @@ async function main() {
   }
 
   // Hunter tokens have no Meteora pool to grade for LP — only the spot verdict
-  // (from birdeye velocity by mint) is meaningful here.
+  // (from birdeye velocity by mint) is meaningful here. Attach the skip reason +
+  // its recoverable/avoid classification so a "miss" that ran can be told apart
+  // from a genuinely missable one.
   const hunterResults = [];
-  for (const [mint, info] of hunterSkips) hunterResults.push(await gradePool(mint, info));
+  for (const [mint, info] of hunterSkips) {
+    const g = await gradePool(mint, info);
+    hunterResults.push({ ...g, skip_reason: info.reason, ...classifySkipReason(info.reason) });
+  }
 
   // ── Aggregate ──
   const lpMissed = results.filter((r) => r.lp === "missed");
@@ -242,6 +265,11 @@ async function main() {
   const hJudged = hunterResults.filter((r) => r.spot === "missed" || r.spot === "blowoff" || r.spot === "correct");
   const hUnknown = hunterResults.filter((r) => r.spot === "unknown" || r.spot === "gone");
   const hunterSpotMissRate = rate(hMissed.length, hJudged.length);
+  // Of the tokens that ran (missed), which were skipped on NO hard term → genuinely
+  // recoverable; the rest ran but were un-buyable (rug/blow-off/thin) → correct avoid.
+  const hRecoverable = hMissed.filter((r) => r.recoverable);
+  const hAvoid = hMissed.filter((r) => !r.recoverable);
+  const hunterRecoverableRate = rate(hRecoverable.length, hJudged.length);
 
   const lpMissRate = rate(lpMissed.length, lpJudged.length);
 
@@ -267,7 +295,10 @@ async function main() {
     hunter_spot_judged: hJudged.length,
     hunter_spot_unknown: hUnknown.length,
     hunter_blowoff_avoided: hBlowoff.length,
-    hunter_spot_miss_rate_pct: hunterSpotMissRate,
+    hunter_spot_miss_rate_pct: hunterSpotMissRate,        // ran-rate (inflated by un-buyable spike-tops)
+    hunter_recoverable_missed: hRecoverable.length,       // ran AND skipped on no hard term
+    hunter_avoid_missed: hAvoid.length,                   // ran but correctly avoided (rug/blow-off/thin)
+    hunter_recoverable_miss_rate_pct: hunterRecoverableRate, // ← the number that matters
     // back-compat
     miss_rate_pct: lpMissRate,
     detail: results,
@@ -295,14 +326,20 @@ async function main() {
   if (hunterResults.length === 0) {
     console.log(`(no Hunter skips in the last ${SPOT_HRS}h old enough to judge, or DB unavailable)`);
   } else {
-    console.log(`Hunter spot miss rate: ${hunterSpotMissRate}% (${hMissed.length}/${hJudged.length}) · ${hBlowoff.length} blow-off avoided · ${hUnknown.length} unknown/gone`);
-    for (const m of hMissed.slice(0, 12)) console.log(`  HUNTER MISSED ${m.name?.slice(0, 18)} | 24h ${pc(m.birdeye?.price24h)} 4h ${pc(m.birdeye?.price4h)} vol ${fmtVol(m.birdeye?.vol24h)}`);
+    console.log(`Ran-rate: ${hunterSpotMissRate}% (${hMissed.length}/${hJudged.length} ran) · ${hBlowoff.length} blow-off avoided · ${hUnknown.length} unknown/gone`);
+    console.log(`RECOVERABLE miss rate: ${hunterRecoverableRate}% (${hRecoverable.length}/${hJudged.length}) — ran AND skipped on no hard risk term`);
+    console.log(`  (the other ${hAvoid.length} that ran were correctly avoided: rug / blow-off / thin pool / LP-unlocked)`);
+    if (hRecoverable.length) {
+      console.log(`  ↓ genuinely recoverable — worth review:`);
+      for (const m of hRecoverable.slice(0, 12)) console.log(`  RECOVERABLE ${m.name?.slice(0, 18)} | 24h ${pc(m.birdeye?.price24h)} 4h ${pc(m.birdeye?.price4h)} vol ${fmtVol(m.birdeye?.vol24h)} | skip: "${(m.skip_reason || "").slice(0, 70)}"`);
+    }
+    for (const m of hAvoid.slice(0, 8)) console.log(`  ran-but-avoid ${m.name?.slice(0, 18)} | 24h ${pc(m.birdeye?.price24h)} | hard: ${m.hard_term}`);
   }
 
-  const verdictRate = hunterResults.length ? hunterSpotMissRate : lpMissRate;
-  console.log(verdictRate > 40
-    ? `\n⚠️ High trade-stack spot miss rate (${verdictRate}%) — Hunter may be too strict.`
-    : `\n✅ Low trade-stack spot miss rate (${verdictRate}%) — Hunter's skips genuinely drained.`);
+  const verdictRate = hunterResults.length ? hunterRecoverableRate : lpMissRate;
+  console.log(verdictRate > 20
+    ? `\n⚠️ Recoverable miss rate ${verdictRate}% — Hunter is leaving buyable edge on the table; review the RECOVERABLE list.`
+    : `\n✅ Recoverable miss rate ${verdictRate}% — the tokens Hunter skipped that ran were genuinely un-buyable (rug/blow-off/thin).`);
   console.log(`\nSaved → benchmark/counterfactual-${new Date().toISOString().slice(0, 10)}.json\n`);
 }
 
