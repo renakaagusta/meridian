@@ -499,6 +499,18 @@ switch (subcommand) {
     break;
   }
 
+  // ── estimate-swap-slippage (read-only Jupiter quote, no tx) ───────
+  case "estimate-swap-slippage": {
+    if (!flags.from || !flags.to || !flags.amount) die("Usage: meridian estimate-swap-slippage --from <mint> --to <mint> --amount <n>");
+    const { estimateSwapSlippage } = await import("./tools/wallet.js");
+    out(await estimateSwapSlippage({
+      input_mint: flags.from,
+      output_mint: flags.to,
+      amount: parseFloat(flags.amount),
+    }));
+    break;
+  }
+
   // ── screen ───────────────────────────────────────────────────────
   case "screen": {
     const { runScreeningCycle } = await import("./index.js");
